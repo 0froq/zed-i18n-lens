@@ -8,6 +8,7 @@ Zed extension plus Language Server for Vue, TypeScript, TSX, JavaScript and JSX.
 - Detect `$t`/`t`/`tc`/`$tc`/`i18n.t` calls, `v-t="'key'"`, `v-t="{ path: 'key' }"`, `<i18n-t keypath="key">` (Vue I18n), `<Trans i18nKey="key">` (react-i18next), and `formatMessage({ id: "key" })` (react-intl)
 - Hover: show all locale values for a key
 - Diagnostics: report missing keys, missing locale entries, mismatched interpolation params, and (on locale files) keys whose params differ across languages
+- Optional raw-text diagnostics: flag likely untranslated Vue/HTML template text and selected user-facing attributes
 - Quick fixes: add missing / remove unused interpolation params on supported i18n calls, and create a missing key in every locale file that lacks it
 - Completion: suggest existing i18n keys with default locale text
 - Definition: jump from a source key to its locale definition; when several locales define the key, pick which language file to open
@@ -82,6 +83,30 @@ For example, if `order.pay_now` exists in `zh-CN` but is missing from `en-US`, t
 Missing i18n key "order.pay_now" in locales: en-US
 ```
 
+### Optional untranslated template text detection
+
+Set `"rawTextDiagnostics": true` in `.zed/i18nlensrc.json` or under `lsp.i18n-lens.settings` to enable warnings with diagnostic code `raw-text`. It is **off by default**, works even without loaded locale files, and can be overridden per monorepo package.
+
+```json
+{
+  "rawTextDiagnostics": true
+}
+```
+
+This first version uses `htmlparser2` to inspect HTML documents and the top-level HTML `<template>` of Vue single-file components:
+
+- Literal text such as `<button>Save changes</button>`.
+- Static `title`, `alt`, `placeholder`, `label`, and `aria-label` attributes.
+- Whole, unescaped quoted literals on those bound attributes, such as `:placeholder="'Enter name'"` or `v-bind:title="'Helpful title'"`. Variables, translation calls, concatenations, template literals and other expressions are not evaluated.
+
+The natural-language heuristics are inspired by i18n Ally's raw-string detection, but this is **not full Ally parity**. They recognize multi-word phrases, title-cased labels and non-Latin text, while ignoring numbers, punctuation, URLs, paths and obvious identifier-like tokens. Lowercase single words, acronyms, text split across elements and ambiguous labels may be missed; names or technical phrases can still produce false positives. Warnings are suggestions, not proof that text must be translated.
+
+Comments, `script`/`style`, Vue custom blocks, interpolations (`{{ ... }}`), translation-component subtrees (`i18n-t`/`I18nT`, legacy `i18n`, `Trans`) and `v-t` elements are excluded. `code`/`pre`, `v-pre`, `v-html`, `v-text` and `translate="no"` subtrees are also skipped; use `translate="no"` to mark intentionally untranslated content. Vue templates using `src` or a non-HTML `lang` (such as Pug) are not inspected.
+
+There is no Babel/JavaScript/TypeScript/JSX string analysis, workspace-wide scan, automatic extraction or raw-text quick fix. Only open Vue/HTML buffers receive these warnings. The parser is tolerant of incomplete markup, not a full Vue compiler; complex or malformed templates can be missed. Existing key/parameter diagnostics and quick fixes are unchanged.
+
+For local development, HTML registration in `extension.toml` requires reinstalling the dev extension in Zed, then running `scripts/deploy-local.ps1` again and restarting the language server. Updating only the server does not register HTML buffers.
+
 ## Project configuration
 
 I18n Lens supports two configuration sources:
@@ -155,7 +180,8 @@ Supported options:
 | `localeDirs` | string[] | `src/locales`, `src/i18n`, `locales`, `i18n` | Workspace-relative directories to scan for locale files. In package configs, paths are relative to that package root. |
 | `inlayHints.enabled` | boolean | `true` | Enables or disables inline translation hints from this language server. Hover, completion, definition, diagnostics, and quick fixes can still work when inline hints are disabled. |
 | `inlayHints.maxLength` | number | `24` | Maximum inline hint label length before truncation. Hover still shows the full text. |
-| `packages` | array | `[]` | Optional monorepo package contexts. Each item needs a workspace-relative `root` and can override `defaultLocale`, `localeDirs`, and `inlayHints`. The language server picks the longest package root matching the currently edited file. |
+| `rawTextDiagnostics` | boolean | `false` | Opt-in warnings for likely untranslated Vue/HTML template text and selected attributes. No automatic extraction. |
+| `packages` | array | `[]` | Optional monorepo package contexts. Each item needs a workspace-relative `root` and can override `defaultLocale`, `localeDirs`, `inlayHints`, and `rawTextDiagnostics`. The language server picks the longest package root matching the currently edited file. |
 
 Invalid or missing config values fall back to defaults. If `.zed/i18nlensrc.json` contains invalid JSON, the language server logs a warning and continues with the Zed settings or default config.
 
@@ -202,7 +228,7 @@ For pnpm/turborepo and other monorepos, put `.zed/i18nlensrc.json` under the wor
 }
 ```
 
-When a document is opened, I18n Lens selects the package whose `root` is the longest path prefix of that document. `localeDirs` inside a package are resolved relative to that package root, so `apps/web/src/locales` and `packages/admin/src/i18n` are indexed independently. Package entries inherit root-level `defaultLocale`, `localeDirs`, and `inlayHints` unless they override them.
+When a document is opened, I18n Lens selects the package whose `root` is the longest path prefix of that document. `localeDirs` inside a package are resolved relative to that package root, so `apps/web/src/locales` and `packages/admin/src/i18n` are indexed independently. Package entries inherit root-level `defaultLocale`, `localeDirs`, `inlayHints`, and `rawTextDiagnostics` unless they override them.
 
 ## Local development
 

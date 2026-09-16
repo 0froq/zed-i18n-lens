@@ -8,6 +8,7 @@ import {
   flattenLocale,
   buildHoverMarkdown,
   getDiagnostics,
+  getRawTextDiagnostics,
   getLocaleParamDiagnostics,
   getParamCodeActions,
   insertNestedJsonKey,
@@ -301,8 +302,15 @@ function normalizeIncomingSettings(value) {
 function validate(document) {
   const context = getProjectContext(document.uri);
   const { locales } = loadLocalesForContext(context);
-  if (isSourceFile(document.uri)) {
-    connection.sendDiagnostics({ uri: document.uri, diagnostics: getDiagnostics(document.getText(), locales) });
+  const templateLanguage = /\.vue$/i.test(document.uri) ? 'vue'
+    : /\.html?$/i.test(document.uri) || document.languageId === 'html' ? 'html' : undefined;
+  if (isSourceFile(document.uri) || templateLanguage) {
+    const text = document.getText();
+    const diagnostics = [
+      ...getDiagnostics(text, locales),
+      ...getRawTextDiagnostics(text, templateLanguage, context.config.rawTextDiagnostics),
+    ];
+    connection.sendDiagnostics({ uri: document.uri, diagnostics });
     return;
   }
   const locale = findLocaleForFile(locales, fileURLToPath(document.uri));

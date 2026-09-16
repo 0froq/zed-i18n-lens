@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it is developed locally.
 
+## [0.12.0] - 2026-09-16
+
+### Added
+
+- Optional raw-text diagnostics for literal user-facing text in HTML documents and Vue single-file component templates. They detect likely natural-language text plus static `title`, `alt`, `placeholder`, `label`, and `aria-label` attributes; simple quoted literals on those bound attributes are also supported.
+- Added the `rawTextDiagnostics` setting, disabled by default and available in Zed settings, `.zed/i18nlensrc.json`, and monorepo package overrides.
+- Registered HTML buffers with I18n Lens so raw-text diagnostics work for standalone `.html` files as well as Vue templates.
+
+### Changed
+
+- Raw-text detection intentionally skips scripts, styles, comments, interpolations, translation components/directives, `code`/`pre`, and explicitly untranslated subtrees. It does not scan JavaScript, TypeScript, or JSX strings, and does not rewrite source files.
+- Bumped extension/package/Cargo version from `0.11.1` to `0.12.0`.
+
 ## [0.11.1] - 2026-07-23
 
 ### Changed
