@@ -476,6 +476,7 @@ test('normalizeI18nLensConfig returns defaults when config is empty', () => {
     defaultLocale: 'zh-CN',
     localeDirs: ['src/locales', 'src/i18n', 'locales', 'i18n'],
     inlayHints: { enabled: true, maxLength: 24 },
+    rawTextDiagnostics: false,
     packages: [],
   });
 });
@@ -502,6 +503,7 @@ test('normalizeI18nLensConfig accepts project overrides', () => {
     defaultLocale: 'en-US',
     localeDirs: ['app/lang'],
     inlayHints: { enabled: false, maxLength: 12 },
+    rawTextDiagnostics: false,
     packages: [],
   });
 });
@@ -515,6 +517,7 @@ test('normalizeI18nLensConfig ignores invalid values safely', () => {
     defaultLocale: 'zh-CN',
     localeDirs: ['src/locales', 'src/i18n', 'locales', 'i18n'],
     inlayHints: { enabled: true, maxLength: 24 },
+    rawTextDiagnostics: false,
     packages: [],
   });
 });
@@ -567,9 +570,10 @@ test('normalizeI18nLensConfig accepts monorepo package overrides and inherits de
     defaultLocale: 'en-US',
     localeDirs: ['shared/locales'],
     inlayHints: { enabled: true, maxLength: 18 },
+    rawTextDiagnostics: false,
     packages: [
-      { root: 'apps/web', defaultLocale: 'zh-CN', localeDirs: ['src/locales'], inlayHints: { enabled: true, maxLength: 18 } },
-      { root: 'packages/admin', defaultLocale: 'en-US', localeDirs: ['shared/locales'], inlayHints: { enabled: false, maxLength: 18 } },
+      { root: 'apps/web', defaultLocale: 'zh-CN', localeDirs: ['src/locales'], inlayHints: { enabled: true, maxLength: 18 }, rawTextDiagnostics: false },
+      { root: 'packages/admin', defaultLocale: 'en-US', localeDirs: ['shared/locales'], inlayHints: { enabled: false, maxLength: 18 }, rawTextDiagnostics: false },
     ],
   });
 });

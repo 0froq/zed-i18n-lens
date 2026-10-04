@@ -23,6 +23,7 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
   const closed = once(child, 'close');
   const pending = new Map();
   const diagnostics = new Map();
+  const waiters = new Set();
   let serial = 0;
   let buffer = Buffer.alloc(0);
   let stderr = '';
@@ -51,6 +52,7 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
         else entry.resolve(message.result);
       } else if (message.method === 'textDocument/publishDiagnostics') {
         diagnostics.set(message.params.uri, message.params.diagnostics);
+        for (const check of [...waiters]) check(message.params.uri, message.params.diagnostics);
       }
     }
   });
@@ -75,9 +77,33 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
   const uri = (name) => pathToFileURL(path.join(root, name)).href;
   const call = (method, name, params = {}) => request(method, { textDocument: { uri: uri(name) }, ...params });
   const sync = (name) => call('textDocument/hover', name, { position });
+  function nextDiagnostics(name, predicate = () => true, timeoutMs = 5000) {
+    const target = uri(name);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiters.delete(check);
+        reject(new Error(`Timed out waiting for diagnostics: ${target}`));
+      }, timeoutMs);
+      const check = (u, items) => {
+        if (u !== target || !predicate(items)) return;
+        clearTimeout(timer);
+        waiters.delete(check);
+        resolve(items);
+      };
+      waiters.add(check);
+    });
+  }
+  function languageId(name) {
+    if (name.endsWith('.vue')) return 'vue';
+    if (/\.html?$/i.test(name)) return 'html';
+    return 'typescript';
+  }
   async function open(name, text, version = 1) {
-    send({ method: 'textDocument/didOpen', params: { textDocument: { uri: uri(name), languageId: name.endsWith('.json') ? 'json' : 'typescript', version, text } } });
+    send({ method: 'textDocument/didOpen', params: { textDocument: { uri: uri(name), languageId: languageId(name), version, text } } });
     await sync(name);
+  }
+  function configure(settings) {
+    send({ method: 'workspace/didChangeConfiguration', params: { settings: { 'i18n-lens': settings } } });
   }
   async function change(name, text, version) {
     send({ method: 'textDocument/didChange', params: { textDocument: { uri: uri(name), version }, contentChanges: [{ text }] } });
@@ -91,7 +117,7 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
     initializationOptions: { defaultLocale: 'en', ...settings },
   });
   send({ method: 'initialized', params: {} });
-  return { root, uri, call, open, change, sync, send, diagnostics, actions };
+  return { root, uri, call, open, change, configure, sync, send, diagnostics, actions, nextDiagnostics };
 }
 
 function documentEdits(action) {
@@ -355,4 +381,33 @@ test('creation never repairs only the writable half of a multi-locale diagnostic
   });
   await s.open('src/app.ts', source);
   assert.deepEqual(await s.actions('src/app.ts'), []);
+});
+
+test('stdio LSP publishes opt-in template diagnostics and clears them on settings/content changes', { timeout: 15000 }, async (t) => {
+  // No locale files: raw text diagnostics must not depend on locale discovery.
+  const s = await startServer(t, {});
+
+  let pending = s.nextDiagnostics('RawText.vue');
+  await s.open('RawText.vue', '<template><button>Save changes</button></template>');
+  assert.deepEqual(await pending, []);
+
+  pending = s.nextDiagnostics('RawText.vue', (items) => items.some((item) => item.code === 'raw-text'));
+  s.configure({ rawTextDiagnostics: true });
+  assert.equal((await pending).length, 1);
+
+  pending = s.nextDiagnostics('RawText.html');
+  await s.open('RawText.html', '<input placeholder="Enter name">');
+  assert.equal((await pending)[0].code, 'raw-text');
+
+  pending = s.nextDiagnostics('RawText.js');
+  await s.open('RawText.js', 'const label = "Save changes";');
+  assert.deepEqual(await pending, []);
+
+  pending = s.nextDiagnostics('RawText.vue');
+  await s.change('RawText.vue', '<template><button>{{ t("save") }}</button></template>', 2);
+  assert.deepEqual(await pending, []);
+
+  pending = s.nextDiagnostics('RawText.html', (items) => items.length === 0);
+  s.configure({ rawTextDiagnostics: false });
+  assert.deepEqual(await pending, []);
 });
