@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it is developed locally.
 
-## [Unreleased]
+## [0.13.0] - 2026-10-04
 
 ### Added
 
@@ -23,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Quick fixes require client support for versioned document changes. Missing-key creation is withheld when any remaining locale target is ambiguous or unwritable; TS/JS module writes and JSONC locale files remain unsupported.
+- Bumped extension/package/Cargo version from `0.12.0` to `0.13.0`.
+
 ## [0.12.0] - 2026-09-16
 
 ### Added

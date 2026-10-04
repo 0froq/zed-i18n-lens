@@ -10,7 +10,7 @@
 
 ## 当前状态
 
-当前已具备（v0.11.1 + 本地 Unreleased 改动，尚未发布）：
+当前已具备（截至 v0.13.0）：
 
 - Zed Dev Extension 可加载
 - Language Server 可通过 `--stdio` 启动
