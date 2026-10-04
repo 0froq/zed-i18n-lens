@@ -375,10 +375,9 @@ test('findLocaleKeyTarget resolves keys inside prefixed locale directory files',
     '/repo/src/locales/zh-CN/common.json': '{\n  "ok": "确定"\n}\n',
   };
 
-  assert.deepEqual(findLocaleKeyTarget(locale, 'common.ok', localeTexts), {
-    filePath: '/repo/src/locales/zh-CN/common.json',
-    position: { line: 1, character: 2 },
-  });
+  const target = findLocaleKeyTarget(locale, 'common.ok', localeTexts);
+  assert.equal(target.filePath, '/repo/src/locales/zh-CN/common.json');
+  assert.deepEqual(target.range, { start: { line: 1, character: 2 }, end: { line: 1, character: 6 } });
 });
 
 test('collectLocaleKeyTargets returns every locale that defines the key, default locale first', () => {
@@ -393,7 +392,7 @@ test('collectLocaleKeyTargets returns every locale that defines the key, default
   };
 
   const targets = collectLocaleKeyTargets(locales, 'common.ok', localeTexts, 'zh-CN');
-  assert.deepEqual(targets, [
+  assert.deepEqual(targets.map(({ filePath, position }) => ({ filePath, position })), [
     { filePath: '/repo/src/locales/zh-CN/common.json', position: { line: 1, character: 2 } },
     { filePath: '/repo/src/locales/en-US.json', position: { line: 2, character: 4 } },
   ]);

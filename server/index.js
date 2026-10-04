@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { createConnection, TextDocuments, ProposedFeatures, TextDocumentSyncKind, MarkupKind, CodeActionKind } from 'vscode-languageserver/node.js';
+import { createConnection, TextDocuments, ProposedFeatures, TextDocumentSyncKind, MarkupKind, CodeActionKind, TextDocumentEdit, CreateFile, ResourceOperationKind } from 'vscode-languageserver/node.js';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import {
   flattenLocale,
@@ -38,6 +38,11 @@ const watchedLocalePaths = new Set();
 let reloadTimer;
 let configMtimeMs;
 let localeCacheByContext = new Map();
+// Whether the client can apply WorkspaceEdit.documentChanges / CreateFile.
+// Without documentChanges there is no versioned-edit support, so multi-file
+// quick fixes are not offered at all rather than applied unsafely.
+let clientSupportsDocumentChanges = false;
+let clientSupportsCreateFile = false;
 const configWatchIntervalMs = 1000;
 const localeWatchIntervalMs = 1000;
 const reloadDebounceMs = 100;
@@ -45,6 +50,11 @@ const reloadDebounceMs = 100;
 connection.onInitialize((params) => {
   workspaceRoot = params.workspaceFolders?.[0]?.uri ? fileURLToPath(params.workspaceFolders[0].uri) : (params.rootUri ? fileURLToPath(params.rootUri) : process.cwd());
   zedSettingsConfig = normalizeIncomingSettings(params.initializationOptions);
+  const editCaps = params.capabilities?.workspace?.workspaceEdit;
+  clientSupportsDocumentChanges = editCaps?.documentChanges === true;
+  clientSupportsCreateFile = clientSupportsDocumentChanges
+    && Array.isArray(editCaps?.resourceOperations)
+    && editCaps.resourceOperations.includes(ResourceOperationKind.Create);
   loadConfig();
   watchConfigFile();
   return { capabilities: { textDocumentSync: TextDocumentSyncKind.Incremental, hoverProvider: true, completionProvider: { triggerCharacters: ['.', '"', "'"] }, definitionProvider: true, referencesProvider: true, inlayHintProvider: true, codeActionProvider: true } };
@@ -58,12 +68,38 @@ connection.onInitialized(() => {
 });
 
 documents.onDidOpen((event) => {
+  if (isLocaleDocument(event.document)) {
+    // An open (possibly dirty) locale document overrides the disk copy, so a
+    // previously cached load is stale the moment the file opens.
+    invalidateLocaleCaches();
+  }
   validate(event.document);
   // A freshly started server may receive the inlay-hint request before the
   // locale cache is ready; prompt the editor to re-request once it is.
   refreshInlayHints();
 });
-documents.onDidChangeContent((event) => validate(event.document));
+
+documents.onDidChangeContent((event) => {
+  if (isLocaleDocument(event.document)) {
+    // Open locale text feeds the cache, so it must be dropped now — the very
+    // next request must already see this snapshot, not a debounced reload.
+    invalidateLocaleCaches();
+    refreshOpenDocuments();
+    refreshInlayHints();
+    return;
+  }
+  validate(event.document);
+});
+
+// An open locale document overrides the disk copy. Closing it reverts to
+// disk, which is also a content change for every feature.
+documents.onDidClose((event) => {
+  if (!isLocaleDocument(event.document)) return;
+  invalidateLocaleCaches();
+  refreshOpenDocuments();
+  refreshInlayHints();
+});
+
 documents.onDidSave(() => scheduleProjectReload());
 
 connection.onDidChangeConfiguration((params) => {
@@ -72,6 +108,7 @@ connection.onDidChangeConfiguration((params) => {
 });
 
 connection.onHover((params) => {
+  if (isLocaleFileUri(params.textDocument.uri)) return null;
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
   const item = keyAtPosition(doc.getText(), params.position);
@@ -85,16 +122,19 @@ connection.onHover((params) => {
 });
 
 connection.onCompletion((params) => {
-  if (!isSourceFile(params.textDocument.uri)) return [];
+  if (!isSourceFile(params.textDocument.uri) || isLocaleFileUri(params.textDocument.uri)) return [];
   const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const prefix = getCompletionPrefix(doc.getText(), params.position);
+  // undefined = caret is not inside an i18n call; '' = empty key prefix.
+  if (prefix === undefined) return [];
   const context = getProjectContext(params.textDocument.uri);
   const { locales } = loadLocalesForContext(context);
-  const prefix = doc ? getCompletionPrefix(doc.getText(), params.position) : '';
   return getCompletions(prefix, locales, context.config.defaultLocale);
 });
 
 connection.languages.inlayHint.on((params) => {
-  if (!isSourceFile(params.textDocument.uri)) return [];
+  if (!isSourceFile(params.textDocument.uri) || isLocaleFileUri(params.textDocument.uri)) return [];
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const context = getProjectContext(params.textDocument.uri);
@@ -103,18 +143,15 @@ connection.languages.inlayHint.on((params) => {
 });
 
 connection.onDefinition((params) => {
+  if (isLocaleFileUri(params.textDocument.uri)) return null;
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
   const item = keyAtPosition(doc.getText(), params.position);
   if (!item) return null;
   const context = getProjectContext(params.textDocument.uri);
   const { locales, localeTexts } = loadLocalesForContext(context);
-  const keyTokenLength = item.key.split('.').at(-1).length + 2;
   const locations = collectLocaleKeyTargets(locales, item.key, localeTexts, context.config.defaultLocale)
-    .map(({ filePath, position }) => ({
-      uri: pathToFileURL(filePath).toString(),
-      range: { start: position, end: { line: position.line, character: position.character + keyTokenLength } },
-    }));
+    .map(({ filePath, range }) => ({ uri: pathToFileURL(filePath).toString(), range }));
   return locations.length ? locations : null;
 });
 
@@ -127,12 +164,8 @@ connection.onReferences((params) => {
   const locations = collectCodeReferences(context, key);
   if (params.context?.includeDeclaration) {
     const { locales, localeTexts } = loadLocalesForContext(context);
-    const keyTokenLength = key.split('.').at(-1).length + 2;
-    for (const { filePath, position } of collectLocaleKeyTargets(locales, key, localeTexts, context.config.defaultLocale)) {
-      locations.push({
-        uri: pathToFileURL(filePath).toString(),
-        range: { start: position, end: { line: position.line, character: position.character + keyTokenLength } },
-      });
+    for (const { filePath, range } of collectLocaleKeyTargets(locales, key, localeTexts, context.config.defaultLocale)) {
+      locations.push({ uri: pathToFileURL(filePath).toString(), range });
     }
   }
   return locations.length ? locations : null;
@@ -142,13 +175,13 @@ connection.onCodeAction((params) => {
   const doc = documents.get(params.textDocument.uri);
   const diagnostics = params.context.diagnostics || [];
   const actions = [];
-  if (doc) {
+  if (clientSupportsDocumentChanges && doc && isSourceFile(params.textDocument.uri) && !isLocaleFileUri(params.textDocument.uri)) {
     for (const action of getParamCodeActions(doc.getText(), diagnostics)) {
       actions.push({
         title: action.title,
         kind: CodeActionKind.QuickFix,
         diagnostics: [action.diagnostic],
-        edit: { changes: { [params.textDocument.uri]: [action.edit] } },
+        edit: { documentChanges: [TextDocumentEdit.create({ uri: doc.uri, version: doc.version }, [action.edit])] },
       });
     }
   }
@@ -156,10 +189,8 @@ connection.onCodeAction((params) => {
   return actions;
 });
 
-// Quick fix for a "missing i18n key" diagnostic: create the key (empty value) in
-// every locale file that lacks it, as a cross-file workspace edit. Only single
-// flat JSON locale files are supported; nested/TS locales are skipped.
 function getCreateKeyActions(diagnostics, context) {
+  if (!clientSupportsDocumentChanges) return [];
   const { locales, localeTexts } = loadLocalesForContext(context);
   const actions = [];
   for (const diagnostic of diagnostics) {
@@ -167,41 +198,152 @@ function getCreateKeyActions(diagnostics, context) {
     const missingLocales = diagnostic.data?.missingLocales;
     if (!key || !Array.isArray(missingLocales) || missingLocales.length === 0) continue;
 
-    const changes = {};
-    for (const name of missingLocales) {
-      const filePath = flatLocaleFile(locales[name]);
-      if (!filePath) continue;
-      const text = localeTexts[filePath] ?? readFileSafe(filePath);
-      if (text === undefined) continue;
-      const newText = insertNestedJsonKey(text, key, '');
-      if (newText === undefined) continue;
-      changes[pathToFileURL(filePath).toString()] = [fullDocumentEdit(text, newText)];
+    const missing = missingLocales.filter((name) => locales[name] && !Object.hasOwn(locales[name].flat, key));
+    const plans = missing.map((name) => planKeyInsertion(key, locales[name], locales, localeTexts));
+    // Do not offer a partial repair of a multi-locale diagnostic.
+    if (!plans.length || plans.some((plan) => !plan || (plan.create && !clientSupportsCreateFile))) continue;
+    const documentChanges = [];
+    for (const plan of plans) {
+      // If a file appeared after this action was computed, fail rather than
+      // inserting into unrelated content at a stale offset.
+      if (plan.create) documentChanges.push(CreateFile.create(plan.uri));
+      documentChanges.push(TextDocumentEdit.create({ uri: plan.uri, version: plan.version }, [minimalTextEdit(plan.text, plan.newText)]));
     }
-
-    const fileCount = Object.keys(changes).length;
-    if (fileCount === 0) continue;
     actions.push({
-      title: `Create i18n key "${key}" in ${fileCount} locale file(s)`,
+      title: `Create i18n key "${key}" in ${plans.length} locale file(s)`,
       kind: CodeActionKind.QuickFix,
       diagnostics: [diagnostic],
-      edit: { changes },
+      edit: { documentChanges },
     });
   }
   return actions;
 }
 
-// A locale backed by a single flat .json file (not a nested directory locale).
-function flatLocaleFile(locale) {
-  if (!locale || !/\.json$/i.test(locale.path || '')) return undefined;
-  const files = locale.files?.length ? locale.files : [locale.path];
-  return files.length === 1 && files[0] === locale.path ? locale.path : undefined;
+// Namespace routing follows loaded file stems. Index-owned prefixes and
+// overlapping layouts are not guessed; ambiguous targets disable the action.
+function planKeyInsertion(key, locale, locales, localeTexts) {
+  if (!locale) return undefined;
+  if (!locale.directories?.length) {
+    const files = locale.files || [];
+    return files.length === 1 && /\.json$/i.test(files[0])
+      ? insertInto(files[0], key) : undefined;
+  }
+  if (locale.directories.length !== 1 || locale.topLevelFiles?.length) return undefined;
+  const directory = locale.directories[0];
+  const targets = filesByStem(locale);
+  const namespaceFiles = [...targets.keys()].filter((stem) => stem !== 'index' && key.startsWith(stem + '.'));
+  if (namespaceFiles.length > 1 || targets.has(key)) return undefined;
+  const indexFiles = targets.get('index') || [];
+  const indexFile = indexFiles.length === 1 && /\.json$/i.test(indexFiles[0]) ? indexFiles[0] : undefined;
+  let indexOwnsPrefix = false;
+  if (indexFiles.length) {
+    if (!indexFile) return undefined;
+    try {
+      const text = localeTexts[indexFile];
+      const prefix = key.split('.')[0];
+      // A whitespace-only index owns nothing; treat it like an empty object.
+      indexOwnsPrefix = Object.keys(JSON.parse(text.trim() ? text : '{}'))
+        .some((existing) => existing === prefix || existing.startsWith(prefix + '.'));
+    } catch { return undefined; }
+  }
+  if (namespaceFiles.length) {
+    if (indexOwnsPrefix) return undefined;
+    const stem = namespaceFiles[0];
+    const files = targets.get(stem);
+    return files.length === 1 && /\.json$/i.test(files[0])
+      ? insertInto(files[0], key.slice(stem.length + 1)) : undefined;
+  }
+  if (indexOwnsPrefix) return insertInto(indexFile, key);
+
+  const siblingStems = new Map();
+  for (const sibling of Object.values(locales)) {
+    if (sibling === locale || sibling.directories?.length !== 1 || sibling.topLevelFiles?.length) continue;
+    for (const [stem, files] of filesByStem(sibling)) {
+      if (stem === 'index' || !key.startsWith(stem + '.')) continue;
+      siblingStems.set(stem, (siblingStems.get(stem) || []).concat(files));
+    }
+  }
+  if (siblingStems.size > 1) return undefined;
+  if (siblingStems.size === 1) {
+    const [stem, files] = siblingStems.entries().next().value;
+    if (files.some((file) => !/\.json$/i.test(file))) return undefined;
+    return insertOrCreate(path.join(directory, stem + '.json'), key.slice(stem.length + 1));
+  }
+  return indexFile ? insertInto(indexFile, key) : undefined;
 }
 
-function fullDocumentEdit(oldText, newText) {
-  const lines = oldText.split('\n');
-  const endLine = lines.length - 1;
-  return { range: { start: { line: 0, character: 0 }, end: { line: endLine, character: lines[endLine].length } }, newText };
+function filesByStem(locale) {
+  const stems = new Map();
+  for (const file of locale.files || []) {
+    const stem = path.basename(file, path.extname(file));
+    if (!stems.has(stem)) stems.set(stem, []);
+    stems.get(stem).push(file);
+  }
+  return stems;
 }
+
+function insertInto(filePath, lookupKey) {
+  if (!lookupKey) return undefined;
+  const text = openDocumentText(filePath) ?? readFileSafe(filePath);
+  if (text === undefined) return undefined;
+  // A whitespace-only file has no JSON structure to insert into; seed it like
+  // an empty object (matching its line-ending style) so the fix still lands
+  // instead of silently disappearing.
+  const source = text.trim() ? text : (text.includes('\r\n') ? '{}\r\n' : '{}\n');
+  const newText = insertNestedJsonKey(source, lookupKey, '');
+  if (newText === undefined) return undefined;
+  return toEditPlan(filePath, text, newText, false);
+}
+
+// Prefer an in-place insert when the file exists or is open as a buffer (the
+// file may have been deleted on disk while its document stays alive); fall
+// back to a CreateFile only when there is truly nothing to edit.
+function insertOrCreate(filePath, lookupKey) {
+  if (fs.existsSync(filePath) || openDocument(filePath)) return insertInto(filePath, lookupKey);
+  return createIn(filePath, lookupKey);
+}
+
+// Create a missing namespace JSON file: only ever proposed with a CreateFile
+// operation ahead of the text edit, and only when the file truly does not
+// exist — never as a fallback guess.
+function createIn(filePath, lookupKey) {
+  if (!lookupKey || fs.existsSync(filePath) || openDocument(filePath)) return undefined;
+  const newText = insertNestedJsonKey('{}\n', lookupKey, '');
+  if (newText === undefined) return undefined;
+  return toEditPlan(filePath, '', newText, true);
+}
+
+function toEditPlan(filePath, text, newText, create) {
+  return { uri: pathToFileURL(filePath).toString(), version: documentVersion(filePath), text, newText, create };
+}
+
+// Smallest single edit turning `oldText` into `newText`: trim the shared
+// prefix/suffix instead of replacing the whole document.
+function minimalTextEdit(oldText, newText) {
+  let start = 0;
+  const maxStart = Math.min(oldText.length, newText.length);
+  while (start < maxStart && oldText[start] === newText[start]) start++;
+  let endOld = oldText.length;
+  let endNew = newText.length;
+  while (endOld > start && endNew > start && oldText[endOld - 1] === newText[endNew - 1]) { endOld--; endNew--; }
+  return { range: { start: offsetToPosition(oldText, start), end: offsetToPosition(oldText, endOld) }, newText: newText.slice(start, endNew) };
+}
+
+function offsetToPosition(text, offset) {
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < offset && i < text.length; i++) {
+    if (text[i] === '\n') { line++; lineStart = i + 1; }
+  }
+  return { line, character: offset - lineStart };
+}
+
+// Document version for an annotated TextDocumentEdit: the exact version for an
+// open document, null when the file is not open in the editor.
+function documentVersion(filePath) {
+  return openDocument(filePath)?.version ?? null;
+}
+
 
 function getProjectContext(uri) {
   loadConfigIfChanged();
@@ -256,6 +398,10 @@ function scheduleProjectReload() {
   }, reloadDebounceMs);
 }
 
+function invalidateLocaleCaches() {
+  localeCacheByContext = new Map();
+}
+
 function refreshOpenDocuments() {
   for (const doc of documents.all()) validate(doc);
 }
@@ -273,7 +419,7 @@ function loadConfigIfChanged() {
   const nextMtimeMs = fs.existsSync(configPath) ? fs.statSync(configPath).mtimeMs : 0;
   if (configMtimeMs === nextMtimeMs) return;
   loadConfig();
-  localeCacheByContext = new Map();
+  invalidateLocaleCaches();
 }
 
 function loadConfig() {
@@ -301,15 +447,50 @@ function normalizeIncomingSettings(value) {
 function validate(document) {
   const context = getProjectContext(document.uri);
   const { locales } = loadLocalesForContext(context);
-  if (isSourceFile(document.uri)) {
+  if (isSourceFile(document.uri) && !isLocaleFileUri(document.uri)) {
     connection.sendDiagnostics({ uri: document.uri, diagnostics: getDiagnostics(document.getText(), locales) });
     return;
   }
-  const locale = findLocaleForFile(locales, fileURLToPath(document.uri));
+  const filePath = fileURLToPath(document.uri);
+  const locale = findLocaleForFile(locales, filePath);
   if (!locale) return;
-  connection.sendDiagnostics({ uri: document.uri, diagnostics: getLocaleParamDiagnostics(locale, fileURLToPath(document.uri), document.getText(), locales) });
+  connection.sendDiagnostics({ uri: document.uri, diagnostics: getLocaleParamDiagnostics(locale, filePath, document.getText(), locales) });
 }
+
 function isSourceFile(uri) { return /\.(vue|tsx?|jsx?)$/i.test(uri); }
+
+const LOCALE_FILE_RE = /\.(json|[cm]?[tj]s)$/i;
+
+// Is this file inside a localeDir of ANY configured context? Locale files are
+// identified before source files: a TS locale module must never get source
+// diagnostics, completions or inlay hints.
+function localeDirOfFile(filePath) {
+  const normalized = normalizeFsPathLocal(path.resolve(filePath));
+  for (const context of getAllConfiguredContexts()) {
+    const contextRoot = normalizeFsPathLocal(context.root);
+    for (const dir of context.config.localeDirs || []) {
+      const absDir = normalizeFsPathLocal(path.resolve(contextRoot, dir));
+      if (!isPathInsidePath(normalized, absDir) || normalized === absDir) continue;
+      const relative = normalized.slice(absDir.length + 1);
+      const depth = relative.split('/').length - 1;
+      // Only files directly under the localeDir or one level deep (the locale
+      // directory itself) are locale files, matching the loaders.
+      if (depth <= 1) return { context, dir: absDir, relative };
+    }
+  }
+  return undefined;
+}
+
+function isLocaleFileUri(uri) {
+  let filePath;
+  try { filePath = fileURLToPath(uri); } catch { return false; }
+  const info = localeDirOfFile(filePath);
+  return !!info && LOCALE_FILE_RE.test(filePath);
+}
+
+function isLocaleDocument(document) {
+  try { return isLocaleFileUri(document.uri); } catch { return false; }
+}
 
 const IGNORED_SCAN_DIRS = new Set(['node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', '.output', '.next', '.nuxt', '.cache']);
 const MAX_SCAN_FILES = 5000;
@@ -320,10 +501,14 @@ function resolveKeyAtPosition(uri, position, context) {
   const filePath = fileURLToPath(uri);
   const text = documents.get(uri)?.getText() ?? readFileSafe(filePath);
   if (!text) return undefined;
-  if (isSourceFile(uri)) return keyAtPosition(text, position)?.key;
   const { locales } = loadLocalesForContext(context);
   const locale = findLocaleForFile(locales, filePath);
-  return locale ? localeKeyAtPosition(locale, filePath, text, position) : undefined;
+  // Locale membership wins over the .ts source check: a caret on a key inside
+  // en.ts / zh/index.ts must resolve to the flattened key, never to source
+  // call sites (which would also spuriously match object literals).
+  if (locale) return localeKeyAtPosition(locale, filePath, text, position);
+  if (isSourceFile(uri) && !isLocaleFileUri(uri)) return keyAtPosition(text, position)?.key;
+  return undefined;
 }
 
 function findLocaleForFile(locales, filePath) {
@@ -335,29 +520,57 @@ function findLocaleForFile(locales, filePath) {
   return undefined;
 }
 
-// Every source-code usage of `key` within the project/package root. Prefers the
-// in-memory text of open (possibly unsaved) documents over the on-disk copy.
+// Every source-code usage of `key` inside this context only: files under the
+// context root, excluding roots of other configured packages and locale
+// directories, plus open (possibly unsaved) source documents belonging to the
+// context that do not exist on disk yet. Open text wins over disk text.
 function collectCodeReferences(context, key) {
-  const openTextByPath = new Map();
-  for (const doc of documents.all()) {
-    try { openTextByPath.set(path.resolve(fileURLToPath(doc.uri)), doc.getText()); } catch { /* non-file uri */ }
-  }
+  const contextRoot = normalizeFsPathLocal(context.root);
+  const nestedRoots = getAllConfiguredContexts()
+    .map((candidate) => normalizeFsPathLocal(candidate.root))
+    .filter((root) => root !== contextRoot && isPathInsidePath(root, contextRoot));
+
   const locations = [];
-  for (const filePath of collectSourceFiles(context.root)) {
-    const text = openTextByPath.get(path.resolve(filePath)) ?? readFileSafe(filePath);
-    if (!text) continue;
+  const scanned = new Set();
+  const scan = (filePath, text, uri) => {
+    const resolved = normalizeFsPathLocal(path.resolve(filePath));
+    if (scanned.has(resolved)) return;
+    scanned.add(resolved);
+    if (text === undefined) return;
     for (const range of findCodeKeyRanges(text, key)) {
-      locations.push({ uri: pathToFileURL(filePath).toString(), range });
+      locations.push({ uri: uri ?? pathToFileURL(filePath).toString(), range });
     }
+  };
+
+  for (const filePath of collectSourceFiles(context.root, nestedRoots)) {
+    scan(filePath, openDocumentText(filePath) ?? readFileSafe(filePath));
+  }
+
+  for (const doc of documents.all()) {
+    let filePath;
+    try { filePath = fileURLToPath(doc.uri); } catch { continue; }
+    if (!isSourceFile(filePath)) continue;
+    const resolved = normalizeFsPathLocal(path.resolve(filePath));
+    if (!isPathInsidePath(resolved, contextRoot)) continue;
+    if (nestedRoots.some((root) => isPathInsidePath(resolved, root))) continue;
+    if (isLocaleFileUri(doc.uri)) continue;
+    scan(filePath, doc.getText(), doc.uri);
   }
   return locations;
 }
 
-function collectSourceFiles(root) {
+function collectSourceFiles(root, excludedRoots = []) {
   const files = [];
   const stack = [root];
+  const excluded = excludedRoots.map((entry) => normalizeFsPathLocal(entry));
+  const localeDirs = getAllConfiguredContexts()
+    .flatMap((context) => (context.config.localeDirs || [])
+      .map((dir) => normalizeFsPathLocal(path.resolve(context.root, dir))));
   while (stack.length && files.length < MAX_SCAN_FILES) {
     const dir = stack.pop();
+    const normalizedDir = normalizeFsPathLocal(dir);
+    if (excluded.some((entry) => isPathInsidePath(normalizedDir, entry))) continue;
+    if (localeDirs.some((entry) => normalizedDir === entry || normalizedDir.startsWith(entry + '/'))) continue;
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const entry of entries) {
@@ -373,8 +586,37 @@ function collectSourceFiles(root) {
   return files;
 }
 
+function openDocument(filePath) {
+  let target;
+  try { target = path.resolve(filePath); } catch { return undefined; }
+  for (const doc of documents.all()) {
+    try {
+      if (path.resolve(fileURLToPath(doc.uri)) === target) return doc;
+    } catch { /* non-file uri */ }
+  }
+  return undefined;
+}
+
+// In-memory text of an open (possibly unsaved) document for filePath.
+function openDocumentText(filePath) {
+  return openDocument(filePath)?.getText();
+}
+
 function readFileSafe(filePath) {
   try { return fs.readFileSync(filePath, 'utf8'); } catch { return undefined; }
+}
+
+// Prefer the open document's current text; fall back to disk.
+function localeText(filePath) {
+  return openDocumentText(filePath) ?? readFileSafe(filePath);
+}
+
+function normalizeFsPathLocal(value) {
+  return String(value || '').replace(/\\/g, '/').replace(/\/+$/g, '');
+}
+
+function isPathInsidePath(filePath, root) {
+  return filePath === root || filePath.startsWith(root + '/');
 }
 
 function getAllConfiguredContexts() {
@@ -411,31 +653,52 @@ function loadLocalesForContext(context) {
 
 function loadLocaleDirectory(localeDir, localeName, next, localeTexts) {
   next[localeName] ||= { path: localeDir, flat: {}, files: [] };
-  for (const file of fs.readdirSync(localeDir)) {
+  next[localeName].directories ||= [];
+  if (!next[localeName].directories.includes(localeDir)) next[localeName].directories.push(localeDir);
+  for (const file of fs.readdirSync(localeDir).sort()) {
     const fullPath = path.join(localeDir, file);
     if (fs.statSync(fullPath).isDirectory()) continue;
+    if (!LOCALE_FILE_RE.test(file)) continue;
+    if (!next[localeName].files.includes(fullPath)) next[localeName].files.push(fullPath);
     try {
-      const text = fs.readFileSync(fullPath, 'utf8');
+      const text = localeText(fullPath);
+      if (text === undefined) continue;
+      localeTexts[fullPath] = text;
       if (file.endsWith('.json')) Object.assign(next[localeName].flat, prefixByFile(file, flattenLocale(JSON.parse(text))));
       else if (/\.[cm]?[tj]s$/i.test(file)) Object.assign(next[localeName].flat, parseTsLocaleModule(text, file));
       else continue;
-      next[localeName].files.push(fullPath);
-      localeTexts[fullPath] = text;
     } catch (error) { connection.console.warn('Failed to load locale file ' + fullPath + ': ' + error.message); }
   }
 }
 
+// Top-level locale files named after the locale itself (en.json, en.ts, …).
+// Keys are stored verbatim — unlike directory locales no file-stem prefix is
+// applied, so parseTsLocaleModule runs as an 'index' module. When both a .json
+// and a .ts/.js file share the locale name, their keys merge (sorted read
+// order keeps this deterministic); writing stays a JSON-only feature.
 function loadLocaleFiles(fullDir, next, localeTexts) {
-  for (const file of fs.readdirSync(fullDir)) {
+  const files = fs.readdirSync(fullDir).sort((a, b) => {
+    const aJson = a.endsWith('.json') ? 0 : 1;
+    const bJson = b.endsWith('.json') ? 0 : 1;
+    return aJson - bJson || a.localeCompare(b);
+  });
+  for (const file of files) {
     const fullPath = path.join(fullDir, file);
     if (fs.statSync(fullPath).isDirectory()) continue;
     try {
-      const text = fs.readFileSync(fullPath, 'utf8');
-      if (file.endsWith('.json')) {
-        const name = path.basename(file, '.json');
-        next[name] = { path: fullPath, flat: flattenLocale(JSON.parse(text)), files: [fullPath] };
-        localeTexts[fullPath] = text;
-      }
+      const isJson = file.endsWith('.json');
+      const isModule = /\.[cm]?[tj]s$/i.test(file);
+      if (!isJson && !isModule) continue;
+      const name = file.replace(/\.(json|[cm]?[tj]s)$/i, '');
+      next[name] ||= { path: fullPath, flat: {}, files: [], topLevelFiles: [] };
+      next[name].topLevelFiles ||= [];
+      if (!next[name].files.includes(fullPath)) next[name].files.push(fullPath);
+      if (!next[name].topLevelFiles.includes(fullPath)) next[name].topLevelFiles.push(fullPath);
+      const text = localeText(fullPath);
+      if (text === undefined) continue;
+      localeTexts[fullPath] = text;
+      const flat = isJson ? flattenLocale(JSON.parse(text)) : parseTsLocaleModule(text, 'index.ts');
+      Object.assign(next[name].flat, flat);
     } catch (error) { connection.console.warn('Failed to load locale file ' + fullPath + ': ' + error.message); }
   }
 }

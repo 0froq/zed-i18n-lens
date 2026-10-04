@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it is developed locally.
 
+## [Unreleased]
+
+### Added
+
+- Create missing keys in directory-based JSON locales, stripping the file-stem namespace correctly. Create missing namespace files only when an existing sibling-locale layout identifies the target and the client supports file creation.
+- End-to-end stdio LSP regressions for locale editing, client edit capabilities, TS locale navigation, and package-isolated references.
+
+### Fixed
+
+- Locale reads now prefer open document contents and refresh on locale open/change/close. Quick fixes use versioned document edits, and key insertion emits a minimal edit instead of replacing the entire locale document.
+- JSON definition lookup and key insertion now follow object boundaries, handle escaped and dotted property names, preserve CRLF, and reject duplicate properties, conflicting paths, and scalar/array prefixes rather than writing into the wrong object.
+- Ignore i18n calls inside comments and ordinary strings, skip concatenated dynamic keys, and restrict completion to supported key contexts while retaining Vue, JSX, and template-literal expressions.
+- Load top-level TS/JS locale modules without a locale-name prefix, and treat locale modules as definitions for references and parameter-consistency diagnostics rather than as source files.
+- Keep references within the selected project/package context and include new unsaved source documents.
+- Missing-key quick fixes are no longer dropped when the target locale file exists but is empty or whitespace-only: it is seeded like an empty object, keeping its line-ending style. Namespace targets that already exist on disk, or are open as an unsaved buffer, are edited in place instead of being skipped.
+
+### Changed
+
+- Quick fixes require client support for versioned document changes. Missing-key creation is withheld when any remaining locale target is ambiguous or unwritable; TS/JS module writes and JSONC locale files remain unsupported.
+
 ## [0.11.1] - 2026-07-23
 
 ### Changed

@@ -131,22 +131,133 @@ function offsetToPosition(text, offset) {
 function makeRange(text, start, end) {
   return { start: offsetToPosition(text, start), end: offsetToPosition(text, end) };
 }
+// Lexical mask over mixed Vue/TS/JSX text: returns the sorted ranges that are
+// NOT real code — comments, plain strings, template-literal raw text, HTML
+// comments, and ordinary (non-directive) attribute values. Vue directive
+// attribute values (`:x="…"`, `v-x="…"`, `@x="…"`, `#x="…"`) and `${…}`
+// interpolations inside template literals stay transparent so real
+// expressions inside them are still scanned. Best-effort lexing only — no AST.
+function computeOpaqueRanges(text) {
+  const ranges = [];
+  const stack = [{ type: 'code' }];
+  const top = () => stack[stack.length - 1];
+  let i = 0;
+  while (i < text.length) {
+    const f = top();
+    const ch = text[i];
+    if (f.type === 'lineComment') {
+      if (ch === '\n') { ranges.push({ start: f.start, end: i }); stack.pop(); }
+      i++;
+      continue;
+    }
+    if (f.type === 'blockComment') {
+      if (ch === '*' && text[i + 1] === '/') { ranges.push({ start: f.start, end: i + 2 }); stack.pop(); i += 2; continue; }
+      i++;
+      continue;
+    }
+    if (f.type === 'htmlComment') {
+      if (ch === '-' && text[i + 1] === '-' && text[i + 2] === '>') { ranges.push({ start: f.start, end: i + 3 }); stack.pop(); i += 3; continue; }
+      i++;
+      continue;
+    }
+    if (f.type === 'string') {
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === f.quote) { ranges.push({ start: f.start, end: i + 1 }); stack.pop(); }
+      i++;
+      continue;
+    }
+    if (f.type === 'template') {
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === '`') { ranges.push({ start: f.start, end: i + 1 }); stack.pop(); i++; continue; }
+      if (ch === '$' && text[i + 1] === '{') {
+        ranges.push({ start: f.start, end: i });
+        stack.pop();
+        stack.push({ type: 'templateExpr', depth: 0 });
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    // code-like frames: code, templateExpr, attrExpr
+    if (f.type === 'attrExpr' && f.depth === 0 && ch === f.quote) { stack.pop(); i++; continue; }
+    if (ch === '{') {
+      if (f.type === 'templateExpr' || f.type === 'attrExpr') f.depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      if (f.type === 'templateExpr') {
+        if (f.depth === 0) { stack.pop(); stack.push({ type: 'template', start: i + 1 }); }
+        else f.depth--;
+      } else if (f.type === 'attrExpr' && f.depth > 0) f.depth--;
+      i++;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') { stack.push({ type: 'lineComment', start: i }); i += 2; continue; }
+    if (ch === '/' && text[i + 1] === '*') { stack.push({ type: 'blockComment', start: i }); i += 2; continue; }
+    if (ch === '<' && text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') { stack.push({ type: 'htmlComment', start: i }); i += 4; continue; }
+    if (ch === '"' || ch === "'") {
+      if (f.type === 'code' && isAttrExprQuote(text, i)) stack.push({ type: 'attrExpr', quote: ch, depth: 0 });
+      else stack.push({ type: 'string', quote: ch, start: i });
+      i++;
+      continue;
+    }
+    if (ch === '`') { stack.push({ type: 'template', start: i }); i++; continue; }
+    i++;
+  }
+  while (stack.length > 1) {
+    const f = stack.pop();
+    if (f.start !== undefined) ranges.push({ start: f.start, end: text.length });
+  }
+  return ranges;
+}
+
+// A quote is a Vue directive attribute opener when preceded by `name=` where
+// name is `:foo`, `@foo`, `#foo`, `v-foo`, or `ns:foo` (v-on:, v-bind:, …).
+// Plain attributes (`title="…"`, JSX `attr="…"`) keep string semantics.
+function isAttrExprQuote(text, quoteOffset) {
+  const before = text.slice(Math.max(0, quoteOffset - 200), quoteOffset);
+  return /(?:^|[\s<"'`])(?:[:@#][\w.:[\]-]*|[\w-]+:[\w.:[\]-]*|v-[\w.:[\]-]*)\s*=\s*$/.test(before);
+}
+
+function isOpaque(ranges, offset) {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid];
+    if (offset < r.start) hi = mid - 1;
+    else if (offset >= r.end) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
 
 export function extractI18nKeys(text) {
   const found = [];
-  collectFunctionCallKeys(text, found);
-  collectFormatMessageKeys(text, found);
+  const opaque = computeOpaqueRanges(text);
+  collectFunctionCallKeys(text, found, opaque);
+  collectFormatMessageKeys(text, found, opaque);
   const patterns = [
     // <i18n-t keypath="key"> (Vue I18n) and <Trans i18nKey="key"> (react-i18next)
     /\b(?:keypath|i18nKey)\s*=\s*(['"])([A-Za-z0-9_.:-]+)\1/g,
     /\bv-t\s*=\s*"'([A-Za-z0-9_.:-]+)'"/g,
+    /\bv-t\s*=\s*'"([A-Za-z0-9_.:-]+)"'/g,
     /\bv-t\s*=\s*"\s*\{\s*path\s*:\s*(['"])([A-Za-z0-9_.:-]+)\1/g,
   ];
   for (const re of patterns) {
     let match;
     while ((match = re.exec(text))) {
+      const before = text[match.index - 1];
+      // Literal attribute only — bound directives (`:keypath`, `@`, `#`, `.prop`)
+      // hold expressions handled by the call scanner, not a literal key.
+      if (before !== undefined && /[\w:@#.-]/.test(before)) continue;
+      if (isOpaque(opaque, match.index)) continue;
       const key = match[2] || match[1];
-      const keyOffsetInMatch = match[0].indexOf(key);
+      const keyOffsetInMatch = match[0].lastIndexOf(key);
       const start = match.index + keyOffsetInMatch;
       const end = start + key.length;
       found.push({ key, range: makeRange(text, start, end), startOffset: start, endOffset: end });
@@ -156,15 +267,19 @@ export function extractI18nKeys(text) {
   return found;
 }
 
-function collectFunctionCallKeys(text, found) {
+function collectFunctionCallKeys(text, found, opaque) {
   // t/$t/tc/$tc/i18n.t/i18n.tc(...) — function calls, incl. Vue I18n plural tc
   const re = /(?:\x24tc?|\btc?|\bi18n\.tc?)\s*\(/g;
   let match;
   while ((match = re.exec(text))) {
     const parenOffset = re.lastIndex - 1;
+    if (/[\w$]/.test(text[match.index - 1] || '')) continue;
+    if (isOpaque(opaque, match.index)) continue;
     const callText = readParens(text, parenOffset);
     if (!callText) continue;
-    const keyMatch = callText.match(/^\(\s*(['"])([A-Za-z0-9_.:-]+)\1/);
+    // First arg must be exactly one string literal — dynamic keys like
+    // `t('prefix.' + name)` are skipped, never half-matched.
+    const keyMatch = callText.match(/^\(\s*(['"])([A-Za-z0-9_.:-]+)\1(?=\s*[,)])/);
     if (!keyMatch) continue;
     const key = keyMatch[2];
     const start = parenOffset + keyMatch[0].indexOf(key);
@@ -176,19 +291,21 @@ function collectFunctionCallKeys(text, found) {
   }
 }
 
-function collectFormatMessageKeys(text, found) {
+function collectFormatMessageKeys(text, found, opaque) {
   const re = /\bformatMessage\s*\(/g;
   let match;
   while ((match = re.exec(text))) {
+    if (/[\w$]/.test(text[match.index - 1] || '')) continue;
+    if (isOpaque(opaque, match.index)) continue;
     const parenOffset = re.lastIndex - 1;
     const callText = readParens(text, parenOffset);
     if (!callText) continue;
     const args = splitArgsWithOffsets(callText.slice(1, -1));
     const idArg = args[0]?.text || '';
-    const keyMatch = idArg.match(/\bid\s*:\s*(['"])([A-Za-z0-9_.:-]+)\1/);
+    const keyMatch = idArg.match(/\bid\s*:\s*(['"])([A-Za-z0-9_.:-]+)\1(?=\s*[,}])/);
     if (!keyMatch) continue;
     const key = keyMatch[2];
-    const start = parenOffset + 1 + idArg.indexOf(key);
+    const start = parenOffset + 1 + args[0].start + keyMatch.index + keyMatch[0].lastIndexOf(key);
     const end = start + key.length;
     const paramsEdit = getParamsEdit(args.slice(1), parenOffset + 1, parenOffset + callText.length - 1);
     const paramsObject = extractParamsObject(args.slice(1), parenOffset + 1);
@@ -208,6 +325,18 @@ function readParens(text, start) {
       if (escaped) escaped = false;
       else if (ch === '\\') escaped = true;
       else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i + 2);
+      if (end < 0) return undefined;
+      i = end;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end < 0) return undefined;
+      i = end + 1;
       continue;
     }
     if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
@@ -351,10 +480,8 @@ export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
   for (const candidate of candidates) {
     const text = localeTexts[candidate.filePath];
     if (!text) continue;
-    const position = /\.json$/i.test(candidate.filePath)
-      ? findJsonKeyLocation(text, candidate.lookupKey)
-      : findLocaleKeyLocation(text, candidate.lookupKey);
-    if (position) return { filePath: candidate.filePath, position };
+    const range = localeKeyRange(text, candidate.lookupKey, /\.json$/i.test(candidate.filePath));
+    if (range) return { filePath: candidate.filePath, position: range.start, range };
   }
 
   const fallback = candidates[0];
@@ -362,7 +489,7 @@ export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
 }
 
 function lookupKeyForLocaleFile(locale, filePath, key) {
-  const isNestedLocaleFile = normalizeFsPath(locale.path) !== normalizeFsPath(filePath);
+  const isNestedLocaleFile = !locale.topLevelFiles?.includes(filePath) && normalizeFsPath(locale.path) !== normalizeFsPath(filePath);
   const stem = fileStem(filePath);
   if (isNestedLocaleFile && stem && stem !== 'index' && key.startsWith(stem + '.')) return key.slice(stem.length + 1);
   return key;
@@ -466,16 +593,14 @@ export function getLocaleParamConsistency(key, locales) {
 export function getLocaleParamDiagnostics(locale, filePath, text, locales) {
   if (!locale?.flat) return [];
   const isJson = /\.json$/i.test(filePath);
+  const jsonRoot = isJson ? parseJsonStructure(text) || null : undefined;
   const diagnostics = [];
   for (const key of Object.keys(locale.flat)) {
     const consistency = getLocaleParamConsistency(key, locales);
     if (consistency.consistent) continue;
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, key);
-    const position = isJson ? findJsonKeyLocation(text, lookupKey) : findLocaleKeyLocation(text, lookupKey);
-    if (!position) continue;
-    const leaf = lookupKey.split('.').at(-1);
-    const end = { line: position.line, character: position.character + leaf.length + (isJson ? 2 : 0) };
-    diagnostics.push(paramInconsistencyDiagnostic(key, { start: position, end }, consistency.perLocale));
+    const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
+    if (range) diagnostics.push(paramInconsistencyDiagnostic(key, range, consistency.perLocale));
   }
   return diagnostics;
 }
@@ -619,118 +744,162 @@ export function collectLocaleKeyTargets(locales, key, localeTexts = {}, defaultL
 export function localeKeyAtPosition(locale, filePath, text, position) {
   if (!locale || !locale.flat || !text || !position) return undefined;
   const isJson = /\.json$/i.test(filePath);
+  const jsonRoot = isJson ? parseJsonStructure(text) || null : undefined;
   let lineFallback;
   let lineFallbackCount = 0;
   for (const fullKey of Object.keys(locale.flat)) {
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, fullKey);
-    const loc = isJson ? findJsonKeyLocation(text, lookupKey) : findLocaleKeyLocation(text, lookupKey);
-    if (!loc || loc.line !== position.line) continue;
-    const leaf = lookupKey.split('.').at(-1);
-    const tokenStart = loc.character;
-    const tokenEnd = tokenStart + leaf.length + (isJson ? 2 : 0);
-    if (position.character >= tokenStart && position.character <= tokenEnd) return fullKey;
+    const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
+    if (!range || range.start.line !== position.line) continue;
+    if (comparePosition(position, range.start) >= 0 && comparePosition(position, range.end) < 0) return fullKey;
     lineFallback = fullKey;
     lineFallbackCount++;
   }
-  return lineFallbackCount === 1 ? lineFallback : undefined;
+  return !isJson && lineFallbackCount === 1 ? lineFallback : undefined;
 }
 
 export function getCompletionPrefix(text, position) {
-  const offset = positionToOffset(text, position);
-  const before = text.slice(0, offset);
+  const before = text.slice(0, positionToOffset(text, position));
+  const opaque = computeOpaqueRanges(before);
   const patterns = [
-    /(?:\x24tc?|\btc?|\bi18n\.tc?)\(\s*['"]([A-Za-z0-9_.:-]*)$/,
+    /(?:\x24tc?|\btc?|\bi18n\.tc?)\s*\(\s*['"]([A-Za-z0-9_.:-]*)$/,
     /\bformatMessage\s*\(\s*\{[^}]*?\bid\s*:\s*['"]([A-Za-z0-9_.:-]*)$/,
     /\b(?:keypath|i18nKey)\s*=\s*['"]([A-Za-z0-9_.:-]*)$/,
-    /v-t\s*=\s*"'([A-Za-z0-9_.:-]*)$/,
+    /\bv-t\s*=\s*"'([A-Za-z0-9_.:-]*)$/,
+    /\bv-t\s*=\s*'\x22([A-Za-z0-9_.:-]*)$/,
+    /\bv-t\s*=\s*"\s*\{\s*path\s*:\s*['"]([A-Za-z0-9_.:-]*)$/,
   ];
   for (const re of patterns) {
     const match = before.match(re);
-    if (match) return match[1];
-  }
-  return '';
-}
-
-export function findJsonKeyLocation(jsonText, key) {
-  const parts = key.split('.');
-  let cursor = 0;
-  for (const part of parts) {
-    const re = new RegExp('"' + escapeRegExp(part) + '"\\s*:', 'g');
-    re.lastIndex = cursor;
-    const match = re.exec(jsonText);
-    if (!match) return undefined;
-    cursor = match.index + match[0].length;
-    if (part === parts[parts.length - 1]) return offsetToPosition(jsonText, match.index);
+    if (!match || isOpaque(opaque, match.index)) continue;
+    if (/[\w$:@#-]/.test(before[match.index - 1] || '')) continue;
+    return match[1];
   }
   return undefined;
 }
 
-// Surgically insert a dotted `key` into a JSON document, creating intermediate
-// objects as needed and preserving the rest of the file's formatting. Returns
-// the new text, or undefined if the JSON is unparseable or the key already exists.
-export function insertNestedJsonKey(jsonText, key, value = '') {
-  let root;
-  try { root = JSON.parse(jsonText); } catch { return undefined; }
-  if (!root || typeof root !== 'object' || Array.isArray(root)) return undefined;
-  if (getValueByKey(root, key) !== undefined) return undefined;
-
-  const parts = key.split('.');
-  let node = root;
-  let existingDepth = 0;
-  for (; existingDepth < parts.length - 1; existingDepth++) {
-    const next = node[parts[existingDepth]];
-    if (next && typeof next === 'object' && !Array.isArray(next)) node = next;
-    else break;
-  }
-
-  const span = findJsonObjectSpan(jsonText, parts.slice(0, existingDepth));
-  if (!span) return undefined;
-
-  const unit = detectIndentUnit(jsonText);
-  const snippet = buildNestedProperty(parts.slice(existingDepth), value, unit.repeat(existingDepth + 1), unit);
-  const inner = jsonText.slice(span.openBrace + 1, span.contentEnd).trim();
-  if (inner.length === 0) {
-    return jsonText.slice(0, span.openBrace + 1) + '\n' + snippet + '\n' + unit.repeat(existingDepth) + jsonText.slice(span.closeBrace);
-  }
-  const needsComma = jsonText[span.contentEnd - 1] !== ',';
-  return jsonText.slice(0, span.contentEnd) + (needsComma ? ',' : '') + '\n' + snippet + jsonText.slice(span.contentEnd);
+export function findJsonKeyLocation(jsonText, key) {
+  return localeKeyRange(jsonText, key, true)?.start;
 }
 
-function findJsonObjectSpan(jsonText, pathParts) {
-  let searchFrom = 0;
-  if (pathParts.length) {
-    const pos = findJsonKeyLocation(jsonText, pathParts.join('.'));
-    if (!pos) return undefined;
-    const colon = jsonText.indexOf(':', positionToOffset(jsonText, pos));
-    if (colon === -1) return undefined;
-    searchFrom = colon + 1;
+function localeKeyRange(text, key, isJson, jsonRoot = isJson ? parseJsonStructure(text) : undefined) {
+  if (isJson) {
+    const property = findJsonProperty(jsonRoot, key.split('.'));
+    return property ? makeRange(text, property.start, property.end) : undefined;
   }
-  const openBrace = jsonText.indexOf('{', searchFrom);
-  if (openBrace === -1) return undefined;
-  const closeBrace = matchBrace(jsonText, openBrace);
-  if (closeBrace === -1) return undefined;
-  let contentEnd = closeBrace;
-  while (contentEnd > openBrace + 1 && /\s/.test(jsonText[contentEnd - 1])) contentEnd--;
-  return { openBrace, closeBrace, contentEnd };
+  const start = findLocaleKeyLocation(text, key);
+  if (!start) return undefined;
+  const offset = positionToOffset(text, start);
+  const token = text.slice(offset).match(/^(?:'[^']*'|"[^"]*"|[\w$-]+)/);
+  return token ? makeRange(text, offset, offset + token[0].length) : undefined;
 }
 
-function matchBrace(text, open) {
-  let depth = 0;
-  let quote = false;
-  let escaped = false;
-  for (let i = open; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') quote = false;
-      continue;
+// JSON.parse validates the grammar; this walk retains property-token and value
+// boundaries for edits. Maps avoid prototype keys and duplicate keys are refused.
+function parseJsonStructure(text) {
+  try { JSON.parse(text); } catch { return undefined; }
+  let offset = 0;
+  let duplicate = false;
+  const whitespace = () => { while (/\s/.test(text[offset] || '') && offset < text.length) offset++; };
+  function stringEnd() {
+    offset++;
+    while (offset < text.length) {
+      if (text[offset] === '\\') offset += 2;
+      else if (text[offset++] === '"') break;
     }
-    if (ch === '"') quote = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}' && --depth === 0) return i;
   }
-  return -1;
+  function value() {
+    whitespace();
+    const start = offset;
+    const properties = text[offset] === '{' ? new Map() : undefined;
+    if (properties) {
+      offset++;
+      whitespace();
+      while (text[offset] !== '}') {
+        const keyStart = offset;
+        stringEnd();
+        const keyEnd = offset;
+        const key = JSON.parse(text.slice(keyStart, keyEnd));
+        whitespace();
+        offset++; // colon
+        const child = value();
+        if (properties.has(key)) duplicate = true;
+        properties.set(key, { start: keyStart, end: keyEnd, value: child });
+        whitespace();
+        if (text[offset] !== ',') break;
+        offset++;
+        whitespace();
+      }
+      offset++;
+    } else if (text[offset] === '[') {
+      offset++;
+      whitespace();
+      while (text[offset] !== ']') {
+        value();
+        whitespace();
+        if (text[offset] !== ',') break;
+        offset++;
+      }
+      offset++;
+    } else if (text[offset] === '"') {
+      stringEnd();
+    } else {
+      while (offset < text.length && !/[\s,\]}]/.test(text[offset])) offset++;
+    }
+    return { start, end: offset, properties };
+  }
+  const root = value();
+  return duplicate ? undefined : root;
+}
+
+function findJsonProperty(node, parts) {
+  if (!node?.properties) return undefined;
+  let found;
+  for (let count = 1; count <= parts.length; count++) {
+    const property = node.properties.get(parts.slice(0, count).join('.'));
+    if (!property) continue;
+    const candidate = count === parts.length ? property : findJsonProperty(property.value, parts.slice(count));
+    if (!candidate) continue;
+    if (found) return undefined; // dotted and nested representations collide
+    found = candidate;
+  }
+  return found;
+}
+
+// Insert only into an unambiguous object path. Existing scalar/array prefixes,
+// duplicate properties and existing values are never overwritten.
+export function insertNestedJsonKey(jsonText, key, value = '') {
+  let node = parseJsonStructure(jsonText);
+  let parts = key.split('.');
+  if (!node?.properties || parts.some((part) => !part)) return undefined;
+  let depth = 0;
+  while (true) {
+    const matches = [];
+    for (let count = 1; count <= parts.length; count++) {
+      const property = node.properties.get(parts.slice(0, count).join('.'));
+      if (property) matches.push({ count, property });
+    }
+    if (!matches.length) break;
+    if (matches.length !== 1) return undefined;
+    const { count, property } = matches[0];
+    if (count === parts.length || !property.value.properties) return undefined;
+    parts = parts.slice(count);
+    node = property.value;
+    depth++;
+  }
+  const eol = jsonText.includes('\r\n') ? '\r\n' : '\n';
+  const unit = detectIndentUnit(jsonText);
+  const firstProperty = node.properties.values().next().value;
+  const lineStart = firstProperty ? jsonText.lastIndexOf('\n', firstProperty.start) + 1 : -1;
+  const existingIndent = firstProperty ? jsonText.slice(lineStart, firstProperty.start) : '';
+  const indent = firstProperty && /^[ \t]+$/.test(existingIndent) ? existingIndent : unit.repeat(depth + 1);
+  const snippet = buildNestedProperty(parts, value, indent, unit, eol);
+  let contentEnd = node.end - 1;
+  while (contentEnd > node.start + 1 && /\s/.test(jsonText[contentEnd - 1])) contentEnd--;
+  if (!node.properties.size) {
+    return jsonText.slice(0, node.start + 1) + eol + snippet + eol + indent.slice(0, -unit.length) + jsonText.slice(node.end - 1);
+  }
+  return jsonText.slice(0, contentEnd) + ',' + eol + snippet + jsonText.slice(contentEnd);
 }
 
 function detectIndentUnit(jsonText) {
@@ -738,10 +907,10 @@ function detectIndentUnit(jsonText) {
   return match ? match[1] : '  ';
 }
 
-function buildNestedProperty(parts, value, indent, unit) {
+function buildNestedProperty(parts, value, indent, unit, eol) {
   const keyStr = JSON.stringify(parts[0]);
   if (parts.length === 1) return indent + keyStr + ': ' + JSON.stringify(value);
-  return indent + keyStr + ': {\n' + buildNestedProperty(parts.slice(1), value, indent + unit, unit) + '\n' + indent + '}';
+  return indent + keyStr + ': {' + eol + buildNestedProperty(parts.slice(1), value, indent + unit, unit, eol) + eol + indent + '}';
 }
 
 

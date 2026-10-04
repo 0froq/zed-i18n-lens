@@ -8,10 +8,10 @@ Zed extension plus Language Server for Vue, TypeScript, TSX, JavaScript and JSX.
 - Detect `$t`/`t`/`tc`/`$tc`/`i18n.t` calls, `v-t="'key'"`, `v-t="{ path: 'key' }"`, `<i18n-t keypath="key">` (Vue I18n), `<Trans i18nKey="key">` (react-i18next), and `formatMessage({ id: "key" })` (react-intl)
 - Hover: show all locale values for a key
 - Diagnostics: report missing keys, missing locale entries, mismatched interpolation params, and (on locale files) keys whose params differ across languages
-- Quick fixes: add missing / remove unused interpolation params on supported i18n calls, and create a missing key in every locale file that lacks it
-- Completion: suggest existing i18n keys with default locale text
+- Quick fixes: add missing / remove unused interpolation params, and create missing keys in unambiguous JSON locale targets using versioned edits
+- Completion: suggest existing i18n keys with default locale text only inside supported i18n key positions
 - Definition: jump from a source key to its locale definition; when several locales define the key, pick which language file to open
-- References: from a key in a locale file (or a source usage), find every place the key is used across the project's source code
+- References: from a locale definition or source usage, find references within the same project/package context, including open source files not yet saved to disk
 
 ## Installation
 
@@ -68,6 +68,8 @@ To open a specific language file, use Go to Definition (Ctrl/Cmd+click or F12) o
 
 Diagnostics refresh automatically when loaded locale files or locale directories change, so editing translation files should update warnings/errors without restarting the extension.
 
+Open locale documents take precedence over disk contents. Opening, changing, or closing an existing locale file refreshes translations and diagnostics without requiring a save.
+
 Diagnostics distinguish between these cases:
 
 - If a key is missing from every loaded locale, it is reported as an error.
@@ -81,6 +83,18 @@ For example, if `order.pay_now` exists in `zh-CN` but is missing from `en-US`, t
 ```text
 Missing i18n key "order.pay_now" in locales: en-US
 ```
+
+## Creating missing keys safely
+
+The missing-key quick fix supports a single JSON file per locale and directory layouts such as `locales/en/common.json`. For `t('common.submit')`, it inserts `submit` into `common.json`, without duplicating the `common.` prefix. `index.json` has no file-stem prefix.
+
+- Edits use the current open document text and version, preserve unrelated content and line endings, and change only the necessary text rather than replacing the entire file.
+- If a target namespace file is missing, the server can create it when another locale establishes the corresponding JSON namespace layout. It does not invent an unknown namespace layout or overwrite a file that appears after the action was requested.
+- Ambiguous layouts (for example, both `common.json` and `common.ts`, overlapping index/namespace ownership including empty namespace objects, or multiple backing directories) do not receive a guessed edit. Invalid JSON, duplicate properties, and scalar/object path conflicts are also refused.
+- A multi-locale diagnostic receives a creation action only when all remaining missing locales can be repaired safely. TS/JS module writes and JSONC locale loading/writes are not supported.
+- Quick fixes require LSP `workspace.workspaceEdit.documentChanges` support. Creating a file additionally requires the `create` resource operation. Existing-file edits use the open document version, or `null` for closed files; the server cannot version-check external changes to closed files.
+
+Recognition skips calls inside comments and ordinary strings, and does not treat a concatenated key such as `t('prefix.' + name)` as a static key. Vue directive expressions, JSX expressions, and calls inside template-literal interpolations remain supported. Recognition is lexical, not full framework binding or scope analysis.
 
 ## Project configuration
 
@@ -181,6 +195,8 @@ src/locales/ja-JP/common.json
 
 A file named `common.json` contributes keys with the `common.` prefix. A file named `index.json` contributes keys without an `index.` prefix.
 
+Top-level TS/JS modules such as `locales/en.ts` are also loaded, without adding an `en.` prefix. Directory modules such as `locales/en/common.ts` retain the `common.` prefix; `index.ts` has no file-stem prefix. Modules are parsed statically, never executed. Their definitions support Find References and cross-language parameter diagnostics, not source-code completions or inlay hints. TS/JS key positioning remains best-effort rather than a full syntax-tree analysis.
+
 ## Monorepo workspaces
 
 For pnpm/turborepo and other monorepos, put `.zed/i18nlensrc.json` under the workspace root and add `packages` entries:
@@ -204,6 +220,8 @@ For pnpm/turborepo and other monorepos, put `.zed/i18nlensrc.json` under the wor
 
 When a document is opened, I18n Lens selects the package whose `root` is the longest path prefix of that document. `localeDirs` inside a package are resolved relative to that package root, so `apps/web/src/locales` and `packages/admin/src/i18n` are indexed independently. Package entries inherit root-level `defaultLocale`, `localeDirs`, and `inlayHints` unless they override them.
 
+Find References excludes separately configured nested package roots and locale modules, so identical keys in independent packages are not mixed. The existing source scanner is bounded at approximately 5,000 files; its results are not a project-wide completeness guarantee for larger workspaces.
+
 ## Local development
 
 Install dependencies:
@@ -217,6 +235,8 @@ Run tests:
 ```bash
 npm test
 ```
+
+The suite covers pure-function behavior plus real stdio LSP sessions in temporary workspaces, including dirty locale buffers, namespace file creation, client capabilities, and package-isolated references.
 
 The language server is published to npm as
 [`i18n-lens-language-server`](https://www.npmjs.com/package/i18n-lens-language-server).

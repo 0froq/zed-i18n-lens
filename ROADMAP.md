@@ -10,7 +10,7 @@
 
 ## 当前状态
 
-当前已具备（截至 v0.9.0）：
+当前已具备（v0.11.1 + 本地 Unreleased 改动，尚未发布）：
 
 - Zed Dev Extension 可加载
 - Language Server 可通过 `--stdio` 启动
@@ -26,9 +26,11 @@
   - Diagnostics：全缺为 error，部分语言缺失为 warning，并校验 interpolation params 缺失/多余
   - Completion 补全已有 i18n key
   - Definition 跳转到 locale 定义，多语言时返回每个语言的位置供选择
-  - Code Action：为缺失 interpolation params 提供 quick fix（已有对象参数时追加，无对象参数时创建 `{ param }`）
+  - Code Action：添加缺失 / 移除多余 interpolation params；在单文件及目录式 JSON locale 中安全创建缺失 key，支持依据已有 namespace 布局创建目标文件
+  - References：从源码或 JSON/TS locale 定义查引用，隔离独立子包并包含尚未落盘的打开源码
+  - 编辑安全：读取未保存 locale，版本化最小编辑，拒绝歧义 JSON 路径及目录路由；注释 / 普通字符串降噪，补全限制在 i18n key 上下文
 - 项目配置 `.zed/i18nlensrc.json`（`defaultLocale` / `localeDirs` / `inlayHints`），支持 monorepo `packages` 多上下文
-- 自动化测试：`npm test`，当前 47 个测试通过
+- 自动化验证：`npm test`（纯函数 + 真实 stdio LSP 回归），以及实际应用 WorkspaceEdit 后观察 locale 刷新与诊断消失的烟测
 - Zed extension 编译验证：`cargo check --target wasm32-wasip1`
 
 ---
@@ -622,14 +624,15 @@ $t('common.submit')
 - Unused params quick fix：`Remove unused i18n params`（重建参数对象、保留在用参数）
 - Code Action 创建缺失 key：`insertNestedJsonKey` 纯函数 + 跨语言文件写入
 - 跨语言参数一致性诊断：locale 文件与源码使用处标记各语言占位符不一致的 key
+- 本地 Unreleased：可信编辑与目录式 JSON key 创建；未保存 locale 优先、版本化局部编辑、结构化 JSON 定位、源码识别 / 补全降噪、顶层 TS/JS 加载、TS 反向引用和项目引用隔离
 
 接下来建议优先做：
 
-1. **发布 `v0.10.0`（及后续版本）并同步 `zed-industries/extensions` PR**
-2. **Assistant slash command i18n report**：`/i18n-report`、`/i18n-missing`、`/i18n-unused`
-3. 项目级扫描报告（未使用 / 缺失 key），可与 slash command 共用扫描核心
-4. 嵌套目录 / TS locale 的「创建缺失 key」支持（当前仅支持单文件 flat JSON）
-5. Rename 同步重命名 key（高风险，待 Code Action 稳定后）
+1. 文案反查 key：在合法 i18n 上下文按翻译内容查找并准确替换 key
+2. 项目级扫描报告与 CLI：缺失、空翻译、参数不一致和疑似未使用 key；必须显式报告扫描边界，不能自动删除动态引用可能使用的 key
+3. 分框架补全语义支持；不以全文件统一 namespace 替代绑定和作用域识别
+4. Rename 同步重命名 key：依赖准确定位、完整引用和冲突检查，扫描不完整时不能执行部分重命名
+5. 报告稳定后再接 Assistant slash command；TS/JS locale 写入及 JSONC 支持仍需独立设计与验收
 
 ---
 
