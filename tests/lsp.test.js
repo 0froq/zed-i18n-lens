@@ -411,3 +411,20 @@ test('stdio LSP publishes opt-in template diagnostics and clears them on setting
   s.configure({ rawTextDiagnostics: false });
   assert.deepEqual(await pending, []);
 });
+
+test('extract action writes the default locale and rewrites the template', async (t) => {
+  const s = await startServer(t, { 'locales/en.json': '{\n  "known": "Known"\n}\n' }, { rawTextDiagnostics: true });
+  const source = '<template><p>Hello world</p><b>{{ $t(\'known\') }}</b></template>';
+  const pending = s.nextDiagnostics('src/Home.vue', (items) => items.some((item) => item.code === 'raw-text'));
+  await s.open('src/Home.vue', source);
+  await pending;
+  const all = await s.actions('src/Home.vue');
+  const action = all.find((a) => a.title.startsWith('Extract'));
+  assert.equal(action.title, 'Extract to i18n key "Home.hello_world"');
+  const [locale, doc] = documentEdits(action);
+  assert.equal(applyText('{\n  "known": "Known"\n}\n', locale), '{\n  "known": "Known",\n  "Home": {\n    "hello_world": "Hello world"\n  }\n}\n');
+  assert.equal(applyText(source, doc), '<template><p>{{ $t(\'Home.hello_world\') }}</p><b>{{ $t(\'known\') }}</b></template>');
+  const inline = await s.call('textDocument/codeAction', 'src/Home.vue', { range: { start: { line: 0, character: 38 }, end: { line: 0, character: 38 } }, context: { diagnostics: [] } });
+  assert.deepEqual(inline.map((a) => a.title), ['Inline i18n key "known" as en']);
+  assert.equal(applyText(source, documentEdits(inline[0])[0]), '<template><p>Hello world</p><b>Known</b></template>');
+});

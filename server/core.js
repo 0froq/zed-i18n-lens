@@ -459,7 +459,8 @@ function collectFunctionCallKeys(text, found, opaque) {
     const args = splitArgsWithOffsets(callText.slice(1, -1));
     const paramsEdit = getParamsEdit(args.slice(1), parenOffset + 1, parenOffset + callText.length - 1);
     const paramsObject = extractParamsObject(args.slice(1), parenOffset + 1);
-    found.push({ key, range: makeRange(text, start, end), startOffset: start, endOffset: end, providedParams: collectParamNames(args.slice(1)), paramsEdit, paramsObject });
+    found.push({ key, range: makeRange(text, start, end), startOffset: start, endOffset: end, providedParams: collectParamNames(args.slice(1)), paramsEdit, paramsObject,
+      call: { start: match.index, end: parenOffset + callText.length, argCount: args.length, quote: keyMatch[1] } });
   }
 }
 
@@ -823,6 +824,95 @@ export function getParamCodeActions(text, diagnostics = []) {
 
     return [];
   });
+}
+
+/**
+ * "Extract to i18n key" for raw-text diagnostics (or raw text inside a selected
+ * range). Key naming is deliberately simple: `<file stem>.<slug>`; an existing
+ * default-locale key with identical text is reused instead.
+ */
+export function getExtractCodeActions(text, language, filePath, range, diagnostics = [], defaultFlat = {}) {
+  let targets = diagnostics.filter((d) => d.code === 'raw-text');
+  const start = range ? positionToOffset(text, range.start) : 0;
+  const end = range ? positionToOffset(text, range.end) : 0;
+  if (!targets.length && end > start) {
+    targets = getRawTextDiagnostics(text, language, true).filter((d) => {
+      const s = positionToOffset(text, d.range.start);
+      return s >= start && positionToOffset(text, d.range.end) <= end;
+    });
+  }
+  return targets.flatMap((diagnostic) => {
+    const s = positionToOffset(text, diagnostic.range.start);
+    const e = positionToOffset(text, diagnostic.range.end);
+    const value = text.slice(s, e).replace(/\s+/g, ' ');
+    // v1: no entities or interpolation-like content; their decoded value is ambiguous.
+    if (!value || /[&<>{}]/.test(value)) return [];
+    const existing = Object.keys(defaultFlat).find((key) => defaultFlat[key] === value);
+    const key = existing || uniqueKey(fileStem(filePath) + '.' + slugify(value), defaultFlat);
+    const attr = /\s((?::|v-bind:)?)([\w-]+)\s*=\s*(["'])(["']?)$/.exec(text.slice(0, s));
+    let edit;
+    if (attr) {
+      const close = attr[4] + attr[3];
+      if (text.slice(e, e + close.length) !== close) return [];
+      const attrStart = s - attr[0].length + 1;
+      edit = { range: makeRange(text, attrStart, e + close.length), newText: `:${attr[2]}="$t('${key}')"` };
+    } else {
+      edit = { range: makeRange(text, s, e), newText: `{{ $t('${key}') }}` };
+    }
+    return [{ title: `Extract to i18n key "${key}"`, diagnostic, key, value, existing: Boolean(existing), edit }];
+  });
+}
+
+function slugify(value) {
+  const words = value.toLowerCase().match(/[a-z0-9]+/g) || [];
+  if (words.length) return words.slice(0, 4).join('_');
+  // Non-Latin text: deterministic FNV-1a hash instead of a transliteration.
+  let hash = 0x811c9dc5;
+  for (const ch of value) hash = Math.imul(hash ^ ch.codePointAt(0), 0x01000193) >>> 0;
+  return 'text_' + hash.toString(16);
+}
+
+function uniqueKey(base, flat) {
+  const taken = (key) => Object.keys(flat).some((k) => k === key || k.startsWith(key + '.') || key.startsWith(k + '.'));
+  let key = base;
+  for (let n = 2; taken(key); n++) key = base + '_' + n;
+  return key;
+}
+
+/**
+ * "Inline as <locale>": replace a param-less t('key') call with locale text.
+ */
+export function getInlineCodeActions(text, range, locales = {}) {
+  const offset = positionToOffset(text, range.start);
+  const endOffset = positionToOffset(text, range.end || range.start);
+  // Cursor (or selection) must sit inside the call; a whole-file range offers nothing.
+  const item = extractI18nKeys(text).find((c) => c.call && offset >= c.call.start && endOffset <= c.call.end);
+  if (!item || item.call.argCount !== 1) return [];
+  const { start, end, quote } = item.call;
+  const before = text.slice(0, start);
+  const after = text.slice(end);
+  const interp = /\{\{\s*$/.exec(before);
+  const interpEnd = /^\s*\}\}/.exec(after);
+  const attr = /\s(?::|v-bind:)([\w-]+)\s*=\s*(["'])\s*$/.exec(before);
+  return Object.entries(locales).flatMap(([name, locale]) => {
+    const value = locale?.flat?.[item.key];
+    if (typeof value !== 'string') return [];
+    let edit;
+    if (interp && interpEnd) {
+      edit = { range: makeRange(text, start - interp[0].length, end + interpEnd[0].length), newText: escapeHtml(value) };
+    } else if (attr && after.trimStart().startsWith(attr[2])) {
+      const close = after.indexOf(attr[2]) + 1;
+      edit = { range: makeRange(text, start - attr[0].length + 1, end + close), newText: `${attr[1]}="${escapeHtml(value)}"` };
+    } else {
+      const escaped = value.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+      edit = { range: makeRange(text, start, end), newText: quote + escaped + quote };
+    }
+    return [{ title: `Inline i18n key "${item.key}" as ${name}`, edit }];
+  });
+}
+
+function escapeHtml(value) {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function sameRange(a, b) {
