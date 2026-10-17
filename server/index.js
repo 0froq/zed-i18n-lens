@@ -232,13 +232,11 @@ function getExtractActions(doc, params, diagnostics) {
   const locale = resolvePreferredLocale(locales, context.config.defaultLocale);
   if (!locale) return [];
   return getExtractCodeActions(doc.getText(), language, fileURLToPath(doc.uri), params.range, diagnostics, locale.flat).flatMap((action) => {
+    const plan = planKeyInsertion(action.key, locale, locales, localeTexts, action.value);
+    if (!plan || (plan.create && !clientSupportsCreateFile)) return [];
     const documentChanges = [];
-    if (!action.existing) {
-      const plan = planKeyInsertion(action.key, locale, locales, localeTexts, action.value);
-      if (!plan || (plan.create && !clientSupportsCreateFile)) return [];
-      if (plan.create) documentChanges.push(CreateFile.create(plan.uri));
-      documentChanges.push(TextDocumentEdit.create({ uri: plan.uri, version: plan.version }, [minimalTextEdit(plan.text, plan.newText)]));
-    }
+    if (plan.create) documentChanges.push(CreateFile.create(plan.uri));
+    documentChanges.push(TextDocumentEdit.create({ uri: plan.uri, version: plan.version }, [minimalTextEdit(plan.text, plan.newText)]));
     documentChanges.push(TextDocumentEdit.create({ uri: doc.uri, version: doc.version }, [action.edit]));
     return [{ title: action.title, kind: CodeActionKind.QuickFix, diagnostics: [action.diagnostic], edit: { documentChanges } }];
   });
