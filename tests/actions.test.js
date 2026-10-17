@@ -8,7 +8,7 @@ function apply(text, edit) {
 }
 
 function extract(text, flat = {}, range) {
-  return getExtractCodeActions(text, 'vue', '/src/components/LoginForm.vue', range, getRawTextDiagnostics(text, 'vue', true), flat);
+  return getExtractCodeActions(text, 'vue', '/src/components/LoginForm.vue', range, range ? [] : getRawTextDiagnostics(text, 'vue', true), flat);
 }
 
 test('extract template text and attributes to a file-stem key', () => {
@@ -36,6 +36,17 @@ test('extract skips interpolation/entities and hashes non-Latin text', () => {
   const parts = extract('<template><p>Hi {{ name }} there friend</p></template>');
   assert.deepEqual(parts.map((a) => a.value), ['there friend']);
   assert.match(extract('<template><p>你好世界</p></template>')[0].key, /^LoginForm\.text_[0-9a-f]+$/);
+});
+
+test('extract accepts lowercase, all-caps and short words', () => {
+  for (const word of ['save', 'OK', 'Go', 'userName']) {
+    const text = `<template><p>${word}</p></template>`;
+    const p = { line: 0, character: text.indexOf(word) + 1 };
+    assert.equal(extract(text, {}, { start: p, end: p })[0]?.value, word, word);
+  }
+  const url = '<template><p>https://example.com</p></template>';
+  const q = { line: 0, character: 16 };
+  assert.deepEqual(extract(url, {}, { start: q, end: q }), []);
 });
 
 test('extract offers selected raw text even without diagnostics', () => {

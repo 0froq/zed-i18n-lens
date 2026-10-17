@@ -67,11 +67,13 @@ function templateInterpolations(text, excludedRanges) {
 
 // Intentionally conservative: natural-language candidates, not arbitrary strings
 // or a dictionary. Single title-cased labels and non-Latin text are useful too.
-export function isLikelyUserFacingText(value) {
+export function isLikelyUserFacingText(value, loose = false) {
   const text = value.trim();
   if (!/\p{L}/u.test(text)) return false;
   if (/^(?:https?:|mailto:|www\.|[/#])|\S+@\S+\.\S+/i.test(text)) return false;
   if (/^[\w.-]+(?:[/\\][\w.-]+)+$|^[\w-]+(?:\.[\w-]+)+$/.test(text)) return false;
+  // Extraction is user-triggered: any remaining text with letters qualifies.
+  if (loose) return true;
   if (/^[A-Z\d_-]+$|^[a-z\d]+(?:[_-][a-z\d]+)+$|^[a-z]+(?:[A-Z][a-z\d]*)+$/.test(text)) return false;
   if (/[^\p{Script=Latin}\p{N}\p{P}\p{S}\p{Z}\p{M}\s]/u.test(text)) return true;
   return (/\s/.test(text) && (text.match(/\p{L}[\p{L}\p{M}]*/gu) || []).length >= 2)
@@ -83,7 +85,7 @@ export function isLikelyUserFacingText(value) {
  * UTF-16, matching LSP positions. Mask Vue expressions before HTML parsing so
  * comparisons and string literals inside {{ ... }} cannot become markup.
  */
-export function getRawTextDiagnostics(text, language, enabled = false) {
+export function getRawTextDiagnostics(text, language, enabled = false, loose = false) {
   if (!enabled || !['vue', 'html'].includes(language)) return [];
   const parserOptions = { withStartIndices: true, withEndIndices: true, recognizeSelfClosing: true };
   // An unmatched "{{" in a comment, script, style or custom SFC block must
@@ -110,7 +112,7 @@ export function getRawTextDiagnostics(text, language, enabled = false) {
   function report(raw, start, value = raw) {
     const leading = raw.length - raw.trimStart().length;
     const trailing = raw.trimEnd().length;
-    if (!isLikelyUserFacingText(value)) return;
+    if (!isLikelyUserFacingText(value, loose)) return;
     diagnostics.push({
       range: makeRange(text, start + leading, start + trailing),
       severity: 2,
@@ -836,10 +838,12 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
   let targets = diagnostics.filter((d) => d.code === 'raw-text');
   const start = range ? positionToOffset(text, range.start) : 0;
   const end = range ? positionToOffset(text, range.end) : 0;
-  if (!targets.length && end > start) {
-    targets = getRawTextDiagnostics(text, language, true).filter((d) => {
+  if (!targets.length && range) {
+    // Selection: every loose candidate inside it. Cursor: the candidate under it.
+    targets = getRawTextDiagnostics(text, language, true, true).filter((d) => {
       const s = positionToOffset(text, d.range.start);
-      return s >= start && positionToOffset(text, d.range.end) <= end;
+      const e = positionToOffset(text, d.range.end);
+      return end > start ? s >= start && e <= end : s <= start && start <= e;
     });
   }
   return targets.flatMap((diagnostic) => {
