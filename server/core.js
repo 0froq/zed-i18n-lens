@@ -1004,6 +1004,11 @@ export function collectLocaleKeyTargets(locales, key, localeTexts = {}, defaultL
 // to the code). Reuses the same key->location logic as Go to Definition to stay
 // consistent; precise for JSON, best-effort (line-based) for TS/JS locale modules.
 export function localeKeyAtPosition(locale, filePath, text, position) {
+  return localeKeyRangeAtPosition(locale, filePath, text, position)?.key;
+}
+
+// Like localeKeyAtPosition, but also returns the range of the key token.
+export function localeKeyRangeAtPosition(locale, filePath, text, position) {
   if (!locale || !locale.flat || !text || !position) return undefined;
   const isJson = /\.json$/i.test(filePath);
   const jsonRoot = isJson ? parseJsonStructure(text) || null : undefined;
@@ -1013,8 +1018,8 @@ export function localeKeyAtPosition(locale, filePath, text, position) {
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, fullKey);
     const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
     if (!range || range.start.line !== position.line) continue;
-    if (comparePosition(position, range.start) >= 0 && comparePosition(position, range.end) < 0) return fullKey;
-    lineFallback = fullKey;
+    if (comparePosition(position, range.start) >= 0 && comparePosition(position, range.end) < 0) return { key: fullKey, range };
+    lineFallback = { key: fullKey, range };
     lineFallbackCount++;
   }
   return !isJson && lineFallbackCount === 1 ? lineFallback : undefined;
@@ -1324,4 +1329,118 @@ function truncateInlayText(value, maxLength) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^()|[\]\{}]/g, '\\$&');
+}
+
+// ---- Rename -------------------------------------------------------------
+
+const RENAME_KEY_RE = /^[A-Za-z0-9_:-]+(?:\.[A-Za-z0-9_:-]+)*$/;
+
+// Range of the key text without surrounding quotes.
+export function unquotedRange(text, range) {
+  const start = positionToOffset(text, range.start);
+  const end = positionToOffset(text, range.end);
+  const quoted = end - start >= 2 && /['"]/.test(text[start]) && text[end - 1] === text[start];
+  return quoted ? makeRange(text, start + 1, end - 1) : range;
+}
+
+// Returns an error message, or undefined when `newKey` is a safe rename target.
+export function validateRenameKey(locales, oldKey, newKey) {
+  if (typeof newKey !== 'string' || !newKey.trim()) return 'New i18n key must not be empty.';
+  if (!RENAME_KEY_RE.test(newKey)) return `Invalid i18n key "${newKey}".`;
+  if (newKey === oldKey) return 'New i18n key is the same as the old key.';
+  for (const [name, locale] of Object.entries(locales || {})) {
+    for (const existing of Object.keys(locale.flat || {})) {
+      if (existing === oldKey) continue;
+      if (existing === newKey) return `i18n key "${newKey}" already exists in locale "${name}".`;
+      if (existing.startsWith(newKey + '.')) return `i18n key "${newKey}" conflicts with existing child key "${existing}" in locale "${name}".`;
+      if (newKey.startsWith(existing + '.')) return `i18n key "${newKey}" conflicts with existing key "${existing}" in locale "${name}".`;
+    }
+  }
+  return undefined;
+}
+
+// Remove a leaf, pruning parents left empty (never the root object).
+export function removeJsonKey(jsonText, key) {
+  const root = parseJsonStructure(jsonText);
+  const chain = findJsonPropertyChain(root, key.split('.'));
+  if (!chain) return undefined;
+  let index = chain.length - 1;
+  while (index > 0 && chain[index].parent.properties.size === 1) index--;
+  const { parent, property } = chain[index];
+  const siblings = [...parent.properties.values()];
+  const at = siblings.indexOf(property);
+  if (siblings.length === 1) {
+    return jsonText.slice(0, parent.start + 1) + '}' + jsonText.slice(parent.end);
+  }
+  if (at < siblings.length - 1) {
+    const lineStart = jsonText.lastIndexOf('\n', property.start) + 1;
+    const nextLineStart = jsonText.lastIndexOf('\n', siblings[at + 1].start) + 1;
+    const ownLine = /^[ \t]*$/.test(jsonText.slice(lineStart, property.start)) && nextLineStart > property.start;
+    return ownLine
+      ? jsonText.slice(0, lineStart) + jsonText.slice(nextLineStart)
+      : jsonText.slice(0, property.start) + jsonText.slice(siblings[at + 1].start);
+  }
+  return jsonText.slice(0, siblings[at - 1].value.end) + jsonText.slice(property.value.end);
+}
+
+function findJsonPropertyChain(node, parts) {
+  if (!node?.properties) return undefined;
+  let found;
+  for (let count = 1; count <= parts.length; count++) {
+    const property = node.properties.get(parts.slice(0, count).join('.'));
+    if (!property) continue;
+    const rest = count === parts.length ? [] : findJsonPropertyChain(property.value, parts.slice(count));
+    if (!rest) continue;
+    if (found) return undefined;
+    found = [{ parent: node, property }, ...rest];
+  }
+  return found;
+}
+
+// Move `oldKey`'s value to `newKey` inside one JSON locale document.
+export function renameJsonKey(jsonText, oldKey, newKey) {
+  const chain = findJsonPropertyChain(parseJsonStructure(jsonText), oldKey.split('.'));
+  if (!chain) return undefined;
+  const { value: node } = chain.at(-1).property;
+  if (node.properties) return undefined;
+  const value = JSON.parse(jsonText.slice(node.start, node.end));
+  const removed = removeJsonKey(jsonText, oldKey);
+  return removed === undefined ? undefined : insertNestedJsonKey(removed, newKey, value);
+}
+
+// Plan locale-file text changes for renaming `oldKey` -> `newKey` in one locale.
+// Returns { edits: [{ filePath, text, newText }] } or { error }.
+export function planLocaleKeyRename(locale, oldKey, newKey, localeTexts = {}) {
+  if (!Object.prototype.hasOwnProperty.call(locale?.flat || {}, oldKey)) return { edits: [] };
+  const target = findLocaleKeyTarget(locale, oldKey, localeTexts);
+  const text = target && localeTexts[target.filePath];
+  if (!target?.range || text === undefined) return { error: `Cannot locate i18n key "${oldKey}" in locale files.` };
+  const { filePath } = target;
+  const oldLookup = lookupKeyForLocaleFile(locale, filePath, oldKey);
+  const newLookup = lookupKeyForLocaleFile(locale, filePath, newKey);
+  if ((oldLookup === oldKey) !== (newLookup === newKey)) {
+    return { error: `Renaming "${oldKey}" to "${newKey}" would move it to another namespace file (${fileStem(filePath)}); not supported.` };
+  }
+  if (/\.json$/i.test(filePath)) {
+    const newText = renameJsonKey(text, oldLookup, newLookup);
+    if (newText === undefined) return { error: `Cannot rename "${oldKey}" in ${filePath}.` };
+    return { edits: [{ filePath, text, newText }] };
+  }
+  // TS/JS locale modules: only the last segment can be renamed in place.
+  const oldParts = oldLookup.split('.');
+  const newParts = newLookup.split('.');
+  if (oldParts.length !== newParts.length || oldParts.slice(0, -1).join('.') !== newParts.slice(0, -1).join('.')) {
+    return { error: `Only the last key segment can be renamed in TS/JS locale module ${filePath}.` };
+  }
+  const last = newParts.at(-1);
+  const start = positionToOffset(text, target.range.start);
+  const end = positionToOffset(text, target.range.end);
+  const token = text.slice(start, end);
+  const quote = /^['"]/.test(token) ? token[0] : (/^[A-Za-z_$][\w$]*$/.test(last) ? '' : "'");
+  return { edits: [{ filePath, text, newText: text.slice(0, start) + quote + last + quote + text.slice(end) }] };
+}
+
+// Source-code TextEdits replacing every usage of `oldKey` with `newKey`.
+export function renameCodeKeyEdits(text, oldKey, newKey) {
+  return findCodeKeyRanges(text, oldKey).map((range) => ({ range, newText: newKey }));
 }

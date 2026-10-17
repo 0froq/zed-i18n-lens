@@ -428,3 +428,24 @@ test('extract action writes the default locale and rewrites the template', async
   assert.deepEqual(inline.map((a) => a.title), ['Inline i18n key "known" as en']);
   assert.equal(applyText(source, documentEdits(inline[0])[0]), '<template><p>Hello world</p><b>Known</b></template>');
 });
+
+test('rename updates all locales and unopened source usages in one WorkspaceEdit', async (t) => {
+  const en = '{\n  "home": {\n    "title": "Home"\n  },\n  "x": "X"\n}\n';
+  const zh = '{\n  "home": {\n    "title": "主页"\n  }\n}\n';
+  const s = await startServer(t, { 'locales/en.json': en, 'locales/zh.json': zh, 'src/Other.ts': "t('home.title');\n" });
+  const source = "<template>{{ $t('home.title') }}</template>";
+  await s.open('src/App.vue', source);
+  const position = { line: 0, character: 20 };
+  assert.deepEqual(await s.call('textDocument/prepareRename', 'src/App.vue', { position }),
+    { range: { start: { line: 0, character: 17 }, end: { line: 0, character: 27 } }, placeholder: 'home.title' });
+  assert.equal(await s.call('textDocument/prepareRename', 'src/App.vue', { position: { line: 0, character: 2 } }), null);
+  const edit = await s.call('textDocument/rename', 'src/App.vue', { position, newName: 'page.heading' });
+  const byFile = Object.fromEntries(edit.documentChanges.map((c) => [path.relative(s.root, fileURLToPath(c.textDocument.uri)), c]));
+  assert.equal(applyText(en, byFile['locales/en.json']), '{\n  "x": "X",\n  "page": {\n    "heading": "Home"\n  }\n}\n');
+  assert.equal(applyText(zh, byFile['locales/zh.json']), '{\n  "page": {\n    "heading": "主页"\n  }\n}\n');
+  assert.equal(applyText(source, byFile['src/App.vue']), "<template>{{ $t('page.heading') }}</template>");
+  assert.equal(applyText("t('home.title');\n", byFile['src/Other.ts']), "t('page.heading');\n");
+  const fromLocale = await s.call('textDocument/prepareRename', 'locales/en.json', { position: { line: 2, character: 6 } });
+  assert.equal(fromLocale.placeholder, 'home.title');
+  await assert.rejects(s.call('textDocument/rename', 'src/App.vue', { position, newName: 'x' }), /already exists/);
+});

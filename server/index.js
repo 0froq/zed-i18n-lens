@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { createConnection, TextDocuments, ProposedFeatures, TextDocumentSyncKind, MarkupKind, CodeActionKind, TextDocumentEdit, CreateFile, ResourceOperationKind } from 'vscode-languageserver/node.js';
+import { createConnection, TextDocuments, ProposedFeatures, TextDocumentSyncKind, MarkupKind, CodeActionKind, TextDocumentEdit, CreateFile, ResourceOperationKind, ResponseError, ErrorCodes } from 'vscode-languageserver/node.js';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import {
   flattenLocale,
@@ -30,6 +30,10 @@ import {
   getExtractCodeActions,
   resolvePreferredLocale,
   getInlineCodeActions,
+  localeKeyRangeAtPosition,
+  unquotedRange,
+  validateRenameKey,
+  planLocaleKeyRename,
 } from './core.js';
 
 const connection = createConnection(ProposedFeatures.all);
@@ -61,7 +65,7 @@ connection.onInitialize((params) => {
     && editCaps.resourceOperations.includes(ResourceOperationKind.Create);
   loadConfig();
   watchConfigFile();
-  return { capabilities: { textDocumentSync: TextDocumentSyncKind.Incremental, hoverProvider: true, completionProvider: { triggerCharacters: ['.', '"', "'"] }, definitionProvider: true, referencesProvider: true, inlayHintProvider: true, codeActionProvider: true } };
+  return { capabilities: { textDocumentSync: TextDocumentSyncKind.Incremental, hoverProvider: true, completionProvider: { triggerCharacters: ['.', '"', "'"] }, definitionProvider: true, referencesProvider: true, inlayHintProvider: true, codeActionProvider: true, renameProvider: { prepareProvider: true } } };
 });
 
 connection.onInitialized(() => {
@@ -174,6 +178,67 @@ connection.onReferences((params) => {
   }
   return locations.length ? locations : null;
 });
+
+connection.onPrepareRename((params) => {
+  const target = resolveRenameTarget(params.textDocument.uri, params.position, getProjectContext(params.textDocument.uri));
+  return target ? { range: target.range, placeholder: target.key } : null;
+});
+
+connection.onRenameRequest((params) => {
+  const uri = params.textDocument.uri;
+  const context = getProjectContext(uri);
+  const target = resolveRenameTarget(uri, params.position, context);
+  if (!target) throw new ResponseError(ErrorCodes.InvalidRequest, 'No i18n key at cursor.');
+  const { key } = target;
+  const newKey = String(params.newName ?? '').trim();
+  const { locales, localeTexts } = loadLocalesForContext(context);
+  const invalid = validateRenameKey(locales, key, newKey);
+  if (invalid) throw new ResponseError(ErrorCodes.InvalidParams, invalid);
+
+  const editsByUri = new Map();
+  const add = (fileUri, version, edits) => {
+    if (!edits.length) return;
+    const entry = editsByUri.get(fileUri) || { version, edits: [] };
+    entry.edits.push(...edits);
+    editsByUri.set(fileUri, entry);
+  };
+  for (const locale of Object.values(locales)) {
+    const plan = planLocaleKeyRename(locale, key, newKey, localeTexts);
+    if (plan.error) throw new ResponseError(ErrorCodes.InvalidParams, plan.error);
+    for (const edit of plan.edits) add(pathToFileURL(edit.filePath).toString(), documentVersion(edit.filePath), [minimalTextEdit(edit.text, edit.newText)]);
+  }
+  const byUri = new Map();
+  for (const { uri: fileUri, range } of collectCodeReferences(context, key)) {
+    if (!byUri.has(fileUri)) byUri.set(fileUri, []);
+    byUri.get(fileUri).push({ range, newText: newKey });
+  }
+  for (const [fileUri, edits] of byUri) {
+    let filePath;
+    try { filePath = fileURLToPath(fileUri); } catch { continue; }
+    add(fileUri, documentVersion(filePath), edits);
+  }
+  if (clientSupportsDocumentChanges) {
+    return { documentChanges: [...editsByUri].map(([fileUri, { version, edits }]) => TextDocumentEdit.create({ uri: fileUri, version }, edits)) };
+  }
+  return { changes: Object.fromEntries([...editsByUri].map(([fileUri, { edits }]) => [fileUri, edits])) };
+});
+
+// The key and its (unquoted) text range under the caret, in source or locale files.
+function resolveRenameTarget(uri, position, context) {
+  let filePath;
+  try { filePath = fileURLToPath(uri); } catch { return undefined; }
+  const text = documents.get(uri)?.getText() ?? readFileSafe(filePath);
+  if (!text) return undefined;
+  const { locales } = loadLocalesForContext(context);
+  const locale = findLocaleForFile(locales, filePath);
+  if (locale) {
+    const found = localeKeyRangeAtPosition(locale, filePath, text, position);
+    return found ? { key: found.key, range: unquotedRange(text, found.range) } : undefined;
+  }
+  if (!isSourceFile(uri) || isLocaleFileUri(uri)) return undefined;
+  const item = keyAtPosition(text, position);
+  return item ? { key: item.key, range: item.range } : undefined;
+}
 
 connection.onCodeAction((params) => {
   const doc = documents.get(params.textDocument.uri);
