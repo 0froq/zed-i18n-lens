@@ -25,10 +25,9 @@ test('extract rewrites bound string literal attributes', () => {
   assert.equal(apply(text, action.edit), `<template><input :placeholder="$t('LoginForm.your_name')"></template>`);
 });
 
-test('extract reuses an existing key with the same text and avoids collisions', () => {
+test('extract always creates a file-stem key (no reuse) and avoids collisions', () => {
   const text = '<template><b>Hello world</b></template>';
-  assert.equal(extract(text, { 'common.hello': 'Hello world' })[0].key, 'common.hello');
-  assert.equal(extract(text, { 'common.hello': 'Hello world' })[0].existing, true);
+  assert.equal(extract(text, { 'common.hello': 'Hello world' })[0].key, 'LoginForm.hello_world');
   assert.equal(extract(text, { 'LoginForm.hello_world': 'Other' })[0].key, 'LoginForm.hello_world_2');
 });
 

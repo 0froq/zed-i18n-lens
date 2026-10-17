@@ -828,8 +828,8 @@ export function getParamCodeActions(text, diagnostics = []) {
 
 /**
  * "Extract to i18n key" for raw-text diagnostics (or raw text inside a selected
- * range). Key naming is deliberately simple: `<file stem>.<slug>`; an existing
- * default-locale key with identical text is reused instead.
+ * range). Key naming is deliberately simple: `<file stem>.<slug>`, always a new
+ * key (identical text elsewhere is not reused; it may need a different translation).
  */
 export function getExtractCodeActions(text, language, filePath, range, diagnostics = [], defaultFlat = {}) {
   let targets = diagnostics.filter((d) => d.code === 'raw-text');
@@ -847,8 +847,7 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     const value = text.slice(s, e).replace(/\s+/g, ' ');
     // v1: no entities or interpolation-like content; their decoded value is ambiguous.
     if (!value || /[&<>{}]/.test(value)) return [];
-    const existing = Object.keys(defaultFlat).find((key) => defaultFlat[key] === value);
-    const key = existing || uniqueKey(fileStem(filePath) + '.' + slugify(value), defaultFlat);
+    const key = uniqueKey(fileStem(filePath) + '.' + slugify(value), defaultFlat);
     const attr = /\s((?::|v-bind:)?)([\w-]+)\s*=\s*(["'])(["']?)$/.exec(text.slice(0, s));
     let edit;
     if (attr) {
@@ -859,7 +858,7 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     } else {
       edit = { range: makeRange(text, s, e), newText: `{{ $t('${key}') }}` };
     }
-    return [{ title: `Extract to i18n key "${key}"`, diagnostic, key, value, existing: Boolean(existing), edit }];
+    return [{ title: `Extract to i18n key "${key}"`, diagnostic, key, value, edit }];
   });
 }
 
