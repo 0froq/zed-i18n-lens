@@ -73,3 +73,41 @@ test('inline skips calls with params or outside a call', () => {
   assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
   assert.deepEqual(getInlineCodeActions(text, { start: { line: 0, character: text.length } }, locales), []);
 });
+
+test('extract key prefix comes from the nearest ancestor with keys', () => {
+  const text = `<template><div><p>{{ t('header.title') }}</p><section class="s"><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></div></template>`;
+  const [action] = extract(text);
+  assert.equal(action.key, 'palette.sections.syntax');
+  assert.equal(action.keySource, 'ancestor');
+  assert.equal(action.title, 'Extract to i18n key "palette.sections.syntax"');
+});
+
+test('extract key prefix uses ancestor common prefix and descends by id anchor', () => {
+  const text = `<template><section id="syntax"><h2>{{ $t('palette.intro.a') }}</h2><h3 :title="$t('palette.other.b')"></h3><p>Keywords here</p></section></template>`;
+  assert.equal(extract(text)[0].key, 'palette.keywords_here');
+  assert.equal(extract(text, { 'palette.syntax.x': 'X' })[0].key, 'palette.syntax.keywords_here');
+});
+
+test('extract key prefix falls back to file-level common prefix', () => {
+  const text = `<template><header>{{ t('app.nav.home') }}</header><main><img src="a.png"><p>Welcome back</p></main></template><script>t('app.nav.about')</script>`;
+  const [action] = extract(text);
+  assert.equal(action.key, 'app.nav.welcome_back');
+  assert.equal(action.keySource, 'file');
+});
+
+test('extract key prefix falls back to file stem when no keys exist', () => {
+  const [action] = extract('<template><p>Hello world</p></template>');
+  assert.equal(action.key, 'LoginForm.hello_world');
+  assert.equal(action.keySource, 'filename');
+});
+
+test('extract key prefix excludes the last segment; single-segment keys give no prefix', () => {
+  assert.equal(extract(`<template><div>{{ t('save') }}<p>Hello world</p></div></template>`)[0].keySource, 'filename');
+  assert.equal(extract(`<template><div>{{ t('a.b') }}<p>Hello world</p></div></template>`)[0].key, 'a.hello_world');
+});
+
+test('extract derived key avoids collisions', () => {
+  const text = `<template><section><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></template>`;
+  assert.equal(extract(text, { 'palette.sections.syntax': 'S' })[0].key, 'palette.sections.syntax_2');
+  assert.equal(extract(text, { 'palette.sections.syntax.x': 'S' })[0].key, 'palette.sections.syntax_2');
+});
