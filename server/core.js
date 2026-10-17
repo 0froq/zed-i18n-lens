@@ -826,8 +826,9 @@ export function getParamCodeActions(text, diagnostics = []) {
 
 /**
  * "Extract to i18n key" for raw-text diagnostics (or raw text inside a selected
- * range). Key naming is deliberately simple: `<file stem>.<slug>`, always a new
- * key (identical text elsewhere is not reused; it may need a different translation).
+ * range). Key = `<prefix>.<slug>` where the prefix comes from deriveKeyPrefix
+ * (nearest ancestor keys > file keys > file stem); always a new key (identical
+ * text elsewhere is not reused; it may need a different translation).
  */
 export function getExtractCodeActions(text, language, filePath, range, diagnostics = [], defaultFlat = {}) {
   let targets = diagnostics.filter((d) => d.code === 'raw-text');
@@ -845,7 +846,8 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     const value = text.slice(s, e).replace(/\s+/g, ' ');
     // v1: no entities or interpolation-like content; their decoded value is ambiguous.
     if (!value || /[&<>{}]/.test(value)) return [];
-    const key = uniqueKey(fileStem(filePath) + '.' + slugify(value), defaultFlat);
+    const { prefix, source: keySource } = deriveKeyPrefix(text, language, filePath, s, e, defaultFlat);
+    const key = uniqueKey(prefix + '.' + slugify(value), defaultFlat);
     const attr = /\s((?::|v-bind:)?)([\w-]+)\s*=\s*(["'])(["']?)$/.exec(text.slice(0, s));
     let edit;
     if (attr) {
@@ -856,8 +858,103 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     } else {
       edit = { range: makeRange(text, s, e), newText: `{{ $t('${key}') }}` };
     }
-    return [{ title: `Extract to i18n key "${key}"`, diagnostic, key, value, edit }];
+    return [{ title: `Extract to i18n key "${key}"`, diagnostic, key, keySource, value, edit }];
   });
+}
+
+const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+/** Lightweight tag-stack scan: returns closed elements { tag, start, end, attrs }. */
+function scanElements(text) {
+  const elements = [];
+  const stack = [];
+  const re = /<!--[\s\S]*?-->|<\/([A-Za-z][\w:.-]*)\s*>|<([A-Za-z][\w:.-]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m[1]) {
+      const tag = m[1].toLowerCase();
+      const idx = stack.map((x) => x.tag).lastIndexOf(tag);
+      if (idx < 0) continue;
+      while (stack.length > idx) {
+        const el = stack.pop();
+        el.end = stack.length === idx ? re.lastIndex : m.index;
+        elements.push(el);
+      }
+    } else if (m[2]) {
+      const tag = m[2].toLowerCase();
+      if (m[4] || VOID_ELEMENTS.has(tag)) continue;
+      const el = { tag, start: m.index, end: text.length, attrs: m[3] };
+      if (tag === 'script' || tag === 'style') {
+        const close = text.toLowerCase().indexOf('</' + tag, re.lastIndex);
+        const stop = close < 0 ? text.length : text.indexOf('>', close) + 1 || text.length;
+        el.end = stop;
+        elements.push(el);
+        re.lastIndex = stop;
+        continue;
+      }
+      stack.push(el);
+    }
+  }
+  while (stack.length) elements.push(stack.pop());
+  return elements;
+}
+
+function commonKeyPrefix(keys) {
+  let common;
+  for (const key of keys) {
+    const parts = key.split('.').slice(0, -1);
+    if (common === undefined) common = parts;
+    else {
+      let i = 0;
+      while (i < common.length && i < parts.length && common[i] === parts[i]) i++;
+      common = common.slice(0, i);
+    }
+  }
+  return common && common.length ? common.join('.') : '';
+}
+
+const normalizeSegment = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/** Descend into an existing child group whose name matches an ancestor's id/data-anchor. */
+function descendByAnchor(prefix, ancestors, flat) {
+  const children = new Set();
+  for (const k of Object.keys(flat)) {
+    if (!k.startsWith(prefix + '.')) continue;
+    const rest = k.slice(prefix.length + 1).split('.');
+    if (rest.length > 1) children.add(rest[0]);
+  }
+  for (const el of ancestors) {
+    const a = /(?:^|\s)(?:id|data-anchor)\s*=\s*(["'])([^"']+)\1/.exec(el.attrs);
+    if (!a) continue;
+    const want = normalizeSegment(a[2]);
+    const hit = [...children].find((c) => normalizeSegment(c) === want);
+    if (hit) return prefix + '.' + hit;
+  }
+  return prefix;
+}
+
+/**
+ * Prefix for a new extracted key: common prefix of keys in the nearest ancestor
+ * element that has any, else of all keys in the file, else the file stem.
+ */
+function deriveKeyPrefix(text, language, filePath, s, e, flat) {
+  const keys = extractI18nKeys(text);
+  if (keys.length && (language === 'vue' || language === 'html')) {
+    const ancestors = scanElements(text)
+      .filter((el) => el.start <= s && el.end >= e && el.tag !== 'template')
+      .sort((a, b) => (a.end - a.start) - (b.end - b.start));
+    for (let i = 0; i < ancestors.length; i++) {
+      const el = ancestors[i];
+      const inside = keys.filter((k) => k.startOffset >= el.start && k.endOffset <= el.end).map((k) => k.key);
+      if (!inside.length) continue;
+      const prefix = commonKeyPrefix(inside);
+      if (prefix) return { prefix: descendByAnchor(prefix, ancestors.slice(0, i + 1), flat), source: 'ancestor' };
+      break;
+    }
+  }
+  const filePrefix = commonKeyPrefix(keys.map((k) => k.key));
+  if (filePrefix) return { prefix: filePrefix, source: 'file' };
+  return { prefix: fileStem(filePath), source: 'filename' };
 }
 
 function slugify(value) {
