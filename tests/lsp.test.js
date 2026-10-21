@@ -411,3 +411,141 @@ test('stdio LSP publishes opt-in template diagnostics and clears them on setting
   s.configure({ rawTextDiagnostics: false });
   assert.deepEqual(await pending, []);
 });
+
+test('nested locale directories preserve namespaces for JSON, TS, JS, and index files', async (t) => {
+  const cases = [
+    ['system.title', 'System', 'system/index.json'],
+    ['system.user.name', 'User', 'system/user.json'],
+    ['admin.user.name', 'Administrator', 'admin/user.json'],
+    ['system.forms.fields.label', 'Name', 'system/forms/fields.ts'],
+    ['system.messages.saved', 'Saved', 'system/messages.js'],
+  ];
+  const source = cases.map(([key]) => `t('${key}')`).join('\n');
+  const s = await startServer(t, {
+    'locales/en/system/index.json': '{"title":"System"}',
+    'locales/en/system/user.json': '{"name":"User"}',
+    'locales/en/admin/user.json': '{"name":"Administrator"}',
+    'locales/en/system/forms/fields.ts': "export default { label: 'Name' };",
+    'locales/en/system/messages.js': "export default { saved: 'Saved' };",
+    'src/app.ts': source,
+  });
+  await s.open('src/app.ts', source);
+  assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')), []);
+  for (const [line, [, text, file]] of cases.entries()) {
+    const caret = { line, character: 4 };
+    assert.match((await s.call('textDocument/hover', 'src/app.ts', { position: caret })).contents.value, new RegExp(text));
+    const [definition] = await s.call('textDocument/definition', 'src/app.ts', { position: caret });
+    assert.equal(definition.uri, s.uri('locales/en/' + file));
+  }
+  const hints = await s.call('textDocument/inlayHint', 'src/app.ts', { range });
+  assert.deepEqual(hints.map((hint) => hint.label), cases.map(([, text]) => text));
+  await s.open('src/completion.ts', "t('system.");
+  const completions = await s.call('textDocument/completion', 'src/completion.ts', { position: { line: 0, character: 10 } });
+  assert.deepEqual(completions.map((item) => item.label).sort(), cases.map(([key]) => key).filter((key) => key.startsWith('system.')).sort());
+});
+
+test('nested locale buffers refresh translations and resolve reverse references', async (t) => {
+  const source = "t('system.user.name')";
+  const s = await startServer(t, {
+    'locales/en/system/user.json': '{"name":"Disk"}',
+    'src/app.ts': source,
+    'src/other.ts': "t('admin.user.name')",
+  });
+  await s.open('src/app.ts', source);
+  const edited = '{"name":"Edited"}';
+  await s.open('locales/en/system/user.json', edited, 3);
+  assert.match((await s.sync('src/app.ts')).contents.value, /Edited/);
+  const references = await s.call('textDocument/references', 'locales/en/system/user.json', {
+    position: { line: 0, character: edited.indexOf('name') }, context: { includeDeclaration: false },
+  });
+  assert.deepEqual(references.map((ref) => ref.uri), [s.uri('src/app.ts')]);
+  assert.deepEqual(await s.call('textDocument/completion', 'locales/en/system/user.json', { position }), []);
+  assert.deepEqual(await s.call('textDocument/inlayHint', 'locales/en/system/user.json', { range }), []);
+  await s.change('locales/en/system/user.json', '{"name":"Changed"}', 4);
+  assert.match((await s.sync('src/app.ts')).contents.value, /Changed/);
+  s.send({ method: 'textDocument/didClose', params: { textDocument: { uri: s.uri('locales/en/system/user.json') } } });
+  assert.match((await s.sync('src/app.ts')).contents.value, /Disk/);
+});
+
+test('nested locale param diagnostics stay in the owning namespace', async (t) => {
+  const system = '{"greeting":"Hi {name}"}';
+  const admin = '{"greeting":"Admin {name}"}';
+  const s = await startServer(t, {
+    'locales/en/system/user.json': system,
+    'locales/zh/system/user.json': '{"greeting":"你好"}',
+    'locales/en/admin/user.json': admin,
+    'locales/zh/admin/user.json': '{"greeting":"管理员 {name}"}',
+  });
+  await s.open('locales/en/admin/user.json', admin);
+  assert.deepEqual(s.diagnostics.get(s.uri('locales/en/admin/user.json')), []);
+  await s.open('locales/en/system/user.json', system);
+  const diagnostics = s.diagnostics.get(s.uri('locales/en/system/user.json'));
+  assert.deepEqual(diagnostics.map((item) => item.data.key), ['system.user.greeting']);
+  await s.open('locales/zh/system/user.json', '{"greeting":"你好 {name}"}');
+  await s.sync('locales/en/system/user.json');
+  assert.deepEqual(s.diagnostics.get(s.uri('locales/en/system/user.json')), []);
+});
+
+test('nested namespace creation edits existing files without duplicating their prefix', async (t) => {
+  const source = "t('system.user.submit')";
+  const files = {
+    'locales/en/system/user.json': '{"name":"User"}',
+    'locales/zh/system/user.json': '{"name":"用户"}',
+    'src/app.ts': source,
+  };
+  const s = await startServer(t, files);
+  await s.open('src/app.ts', source);
+  const [action] = await s.actions('src/app.ts');
+  assert.ok(action);
+  const edits = documentEdits(action);
+  assert.deepEqual(edits.map((edit) => edit.textDocument.uri).sort(), [s.uri('locales/en/system/user.json'), s.uri('locales/zh/system/user.json')].sort());
+  for (const edit of edits) {
+    const original = await fs.readFile(fileURLToPath(edit.textDocument.uri), 'utf8');
+    assert.deepEqual(JSON.parse(applyText(original, edit)), { ...JSON.parse(original), submit: '' });
+  }
+});
+
+test('a missing nested namespace file follows the sibling locale directory layout', async (t) => {
+  const source = "t('system.user.submit')";
+  const s = await startServer(t, {
+    'locales/en/system/user.json': '{"submit":"Submit"}',
+    'locales/zh/system/other.json': '{"title":"其他"}',
+    'src/app.ts': source,
+  });
+  await s.open('src/app.ts', source);
+  const [action] = await s.actions('src/app.ts');
+  assert.ok(action);
+  assert.equal(action.edit.documentChanges[0].kind, 'create');
+  assert.equal(action.edit.documentChanges[0].uri, s.uri('locales/zh/system/user.json'));
+  const [edit] = documentEdits(action);
+  assert.deepEqual(JSON.parse(applyText('', edit)), { submit: '' });
+});
+
+test('nested namespace creation refuses inconsistent sibling directory layouts', async (t) => {
+  const source = "t('system.user.submit')";
+  const s = await startServer(t, {
+    'locales/en/system/user.json': '{"submit":"Submit"}',
+    'locales/fr/system.user.json': '{"submit":"Envoyer"}',
+    'locales/zh/system/other.json': '{"title":"其他"}',
+    'src/app.ts': source,
+  });
+  await s.open('src/app.ts', source);
+  assert.deepEqual(await s.actions('src/app.ts'), []);
+});
+
+test('new files in nested locale directories automatically refresh translations', { timeout: 15000 }, async (t) => {
+  const source = "t('system.notice.saved')";
+  const s = await startServer(t, {
+    'locales/en/system/user.json': '{"name":"User"}',
+    'locales/zh/system/user.json': '{"name":"用户"}',
+    'src/app.ts': source,
+  });
+  await s.open('src/app.ts', source);
+  assert.equal(s.diagnostics.get(s.uri('src/app.ts')).length, 1);
+  const refreshed = s.nextDiagnostics('src/app.ts', (items) => items.length === 0, 10000);
+  await fs.writeFile(path.join(s.root, 'locales/en/system/notice.json'), '{"saved":"Saved"}');
+  await fs.writeFile(path.join(s.root, 'locales/zh/system/notice.json'), '{"saved":"已保存"}');
+  await refreshed;
+  assert.match((await s.sync('src/app.ts')).contents.value, /Saved/);
+  assert.deepEqual((await s.call('textDocument/inlayHint', 'src/app.ts', { range })).map((hint) => hint.label), ['Saved']);
+});

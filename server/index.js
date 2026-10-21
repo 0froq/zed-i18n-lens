@@ -261,14 +261,21 @@ function planKeyInsertion(key, locale, locales, localeTexts) {
     if (sibling === locale || sibling.directories?.length !== 1 || sibling.topLevelFiles?.length) continue;
     for (const [stem, files] of filesByStem(sibling)) {
       if (stem === 'index' || !key.startsWith(stem + '.')) continue;
-      siblingStems.set(stem, (siblingStems.get(stem) || []).concat(files));
+      siblingStems.set(stem, (siblingStems.get(stem) || []).concat(files.map((file) => ({
+        file,
+        relativePath: path.relative(sibling.directories[0], file),
+      }))));
     }
   }
   if (siblingStems.size > 1) return undefined;
   if (siblingStems.size === 1) {
-    const [stem, files] = siblingStems.entries().next().value;
-    if (files.some((file) => !/\.json$/i.test(file))) return undefined;
-    return insertOrCreate(path.join(directory, stem + '.json'), key.slice(stem.length + 1));
+    const [stem, targets] = siblingStems.entries().next().value;
+    if (targets.some(({ file }) => !/\.json$/i.test(file))) return undefined;
+    const relativePaths = new Set(targets.map(({ relativePath }) => relativePath));
+    if (relativePaths.size !== 1) return undefined;
+    const targetPath = path.join(directory, [...relativePaths][0]);
+    return fs.existsSync(path.dirname(targetPath))
+      ? insertOrCreate(targetPath, key.slice(stem.length + 1)) : undefined;
   }
   return indexFile ? insertInto(indexFile, key) : undefined;
 }
@@ -276,7 +283,8 @@ function planKeyInsertion(key, locale, locales, localeTexts) {
 function filesByStem(locale) {
   const stems = new Map();
   for (const file of locale.files || []) {
-    const stem = path.basename(file, path.extname(file));
+    const prefix = locale.filePrefixes?.[file];
+    const stem = prefix === undefined ? path.basename(file, path.extname(file)) : (prefix || 'index');
     if (!stems.has(stem)) stems.set(stem, []);
     stems.get(stem).push(file);
   }
@@ -480,10 +488,7 @@ function localeDirOfFile(filePath) {
       const absDir = normalizeFsPathLocal(path.resolve(contextRoot, dir));
       if (!isPathInsidePath(normalized, absDir) || normalized === absDir) continue;
       const relative = normalized.slice(absDir.length + 1);
-      const depth = relative.split('/').length - 1;
-      // Only files directly under the localeDir or one level deep (the locale
-      // directory itself) are locale files, matching the loaders.
-      if (depth <= 1) return { context, dir: absDir, relative };
+      return { context, dir: absDir, relative };
     }
   }
   return undefined;
@@ -659,21 +664,32 @@ function loadLocalesForContext(context) {
   return loaded;
 }
 
-function loadLocaleDirectory(localeDir, localeName, next, localeTexts) {
+function loadLocaleDirectory(localeDir, localeName, next, localeTexts, rootDir = localeDir) {
   next[localeName] ||= { path: localeDir, flat: {}, files: [] };
-  next[localeName].directories ||= [];
-  if (!next[localeName].directories.includes(localeDir)) next[localeName].directories.push(localeDir);
-  for (const file of fs.readdirSync(localeDir).sort()) {
+  const locale = next[localeName];
+  locale.directories ||= [];
+  if (!locale.directories.includes(rootDir)) locale.directories.push(rootDir);
+  locale.watchDirectories ||= [];
+  if (!locale.watchDirectories.includes(localeDir)) locale.watchDirectories.push(localeDir);
+  locale.filePrefixes ||= {};
+  for (const entry of fs.readdirSync(localeDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const file = entry.name;
     const fullPath = path.join(localeDir, file);
-    if (fs.statSync(fullPath).isDirectory()) continue;
+    if (entry.isDirectory()) {
+      loadLocaleDirectory(fullPath, localeName, next, localeTexts, rootDir);
+      continue;
+    }
     if (!LOCALE_FILE_RE.test(file)) continue;
-    if (!next[localeName].files.includes(fullPath)) next[localeName].files.push(fullPath);
+    if (entry.isSymbolicLink() && fs.statSync(fullPath).isDirectory()) continue;
+    const relativeFile = path.relative(rootDir, fullPath);
+    if (!locale.files.includes(fullPath)) locale.files.push(fullPath);
+    locale.filePrefixes[fullPath] = localeFilePrefix(relativeFile);
     try {
       const text = localeText(fullPath);
       if (text === undefined) continue;
       localeTexts[fullPath] = text;
-      if (file.endsWith('.json')) Object.assign(next[localeName].flat, prefixByFile(file, flattenLocale(JSON.parse(text))));
-      else if (/\.[cm]?[tj]s$/i.test(file)) Object.assign(next[localeName].flat, parseTsLocaleModule(text, file));
+      if (file.endsWith('.json')) Object.assign(locale.flat, prefixByFile(relativeFile, flattenLocale(JSON.parse(text))));
+      else if (/\.[cm]?[tj]s$/i.test(file)) Object.assign(locale.flat, prefixByFile(relativeFile, parseTsLocaleModule(text, 'index.ts')));
       else continue;
     } catch (error) { connection.console.warn('Failed to load locale file ' + fullPath + ': ' + error.message); }
   }
@@ -699,6 +715,8 @@ function loadLocaleFiles(fullDir, next, localeTexts) {
       if (!isJson && !isModule) continue;
       const name = file.replace(/\.(json|[cm]?[tj]s)$/i, '');
       next[name] ||= { path: fullPath, flat: {}, files: [], topLevelFiles: [] };
+      next[name].filePrefixes ||= {};
+      next[name].filePrefixes[fullPath] = '';
       next[name].topLevelFiles ||= [];
       if (!next[name].files.includes(fullPath)) next[name].files.push(fullPath);
       if (!next[name].topLevelFiles.includes(fullPath)) next[name].topLevelFiles.push(fullPath);
@@ -712,9 +730,16 @@ function loadLocaleFiles(fullDir, next, localeTexts) {
 }
 
 function prefixByFile(file, flat) {
-  const stem = path.basename(file, path.extname(file));
-  if (stem === 'index') return flat;
-  return Object.fromEntries(Object.entries(flat).map(([key, value]) => [stem + '.' + key, value]));
+  const prefix = localeFilePrefix(file);
+  if (!prefix) return flat;
+  return Object.fromEntries(Object.entries(flat).map(([key, value]) => [prefix + '.' + key, value]));
+}
+
+function localeFilePrefix(file) {
+  const segments = file.replace(/\\/g, '/').split('/');
+  const stem = segments.pop().replace(/\.[^.]+$/, '');
+  if (stem !== 'index') segments.push(stem);
+  return segments.join('.');
 }
 
 documents.listen(connection);

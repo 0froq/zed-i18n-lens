@@ -635,6 +635,7 @@ export function collectLocaleWatchPaths(localeCache, localeDirs = []) {
   const paths = new Set(localeDirs.filter(Boolean));
   for (const locale of Object.values(localeCache || {})) {
     if (locale.path) paths.add(locale.path);
+    for (const directory of locale.watchDirectories || []) paths.add(directory);
     for (const file of locale.files || []) paths.add(file);
   }
   return [...paths].sort();
@@ -647,6 +648,7 @@ export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
     : (locale.path ? [locale.path] : []);
   const candidates = files
     .map((filePath) => ({ filePath, lookupKey: lookupKeyForLocaleFile(locale, filePath, key) }))
+    .filter((candidate) => candidate.lookupKey !== undefined)
     .sort((a, b) => Number(a.lookupKey === key) - Number(b.lookupKey === key));
 
   for (const candidate of candidates) {
@@ -661,6 +663,11 @@ export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
 }
 
 function lookupKeyForLocaleFile(locale, filePath, key) {
+  const prefix = locale.filePrefixes?.[filePath];
+  if (prefix !== undefined) {
+    if (!prefix) return key;
+    return key.startsWith(prefix + '.') ? key.slice(prefix.length + 1) : undefined;
+  }
   const isNestedLocaleFile = !locale.topLevelFiles?.includes(filePath) && normalizeFsPath(locale.path) !== normalizeFsPath(filePath);
   const stem = fileStem(filePath);
   if (isNestedLocaleFile && stem && stem !== 'index' && key.startsWith(stem + '.')) return key.slice(stem.length + 1);
@@ -771,6 +778,7 @@ export function getLocaleParamDiagnostics(locale, filePath, text, locales) {
     const consistency = getLocaleParamConsistency(key, locales);
     if (consistency.consistent) continue;
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, key);
+    if (lookupKey === undefined) continue;
     const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
     if (range) diagnostics.push(paramInconsistencyDiagnostic(key, range, consistency.perLocale));
   }
@@ -921,6 +929,7 @@ export function localeKeyAtPosition(locale, filePath, text, position) {
   let lineFallbackCount = 0;
   for (const fullKey of Object.keys(locale.flat)) {
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, fullKey);
+    if (lookupKey === undefined) continue;
     const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
     if (!range || range.start.line !== position.line) continue;
     if (comparePosition(position, range.start) >= 0 && comparePosition(position, range.end) < 0) return fullKey;
