@@ -66,7 +66,11 @@ test('JSON edits refuse scalar, null, array, duplicate and overlapping path conf
 
 test('JSON lookup decodes escaped names and preserves the complete dotted key selection', () => {
   const text = '{"order.pay_now":"Pay","escaped\\u002ekey":"Escaped"}';
-  const locale = { path: '/repo/en.json', files: ['/repo/en.json'], flat: { 'order.pay_now': 'Pay', 'escaped.key': 'Escaped' } };
+  const locale = {
+    path: '/repo/en.json', files: ['/repo/en.json'],
+    flat: { 'order.pay_now': 'Pay', 'escaped.key': 'Escaped' },
+    keyFiles: { 'order.pay_now': '/repo/en.json', 'escaped.key': '/repo/en.json' },
+  };
   const target = findLocaleKeyTarget(locale, 'escaped.key', { '/repo/en.json': text });
   assert.equal(text.slice(target.range.start.character, target.range.end.character), '"escaped\\u002ekey"');
   assert.equal(localeKeyAtPosition(locale, locale.path, text, { line: 0, character: text.indexOf('now') }), 'order.pay_now');

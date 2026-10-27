@@ -642,25 +642,22 @@ export function collectLocaleWatchPaths(localeCache, localeDirs = []) {
 
 export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
   if (!locale || !Object.prototype.hasOwnProperty.call(locale.flat || {}, key)) return undefined;
-  const files = Array.isArray(locale.files) && locale.files.length
-    ? locale.files
-    : (locale.path ? [locale.path] : []);
-  const candidates = files
-    .map((filePath) => ({ filePath, lookupKey: lookupKeyForLocaleFile(locale, filePath, key) }))
-    .sort((a, b) => Number(a.lookupKey === key) - Number(b.lookupKey === key));
-
-  for (const candidate of candidates) {
-    const text = localeTexts[candidate.filePath];
-    if (!text) continue;
-    const range = localeKeyRange(text, candidate.lookupKey, /\.json$/i.test(candidate.filePath));
-    if (range) return { filePath: candidate.filePath, position: range.start, range };
-  }
-
-  const fallback = candidates[0];
-  return fallback ? { filePath: fallback.filePath } : undefined;
+  // Namespace specificity does not determine which file won during loading.
+  const filePath = locale.keyFiles?.[key];
+  if (!filePath) return undefined;
+  const lookupKey = lookupKeyForLocaleFile(locale, filePath, key);
+  if (lookupKey === undefined) return undefined;
+  const text = localeTexts[filePath];
+  const range = text ? localeKeyRange(text, lookupKey, /\.json$/i.test(filePath)) : undefined;
+  return range ? { filePath, position: range.start, range } : { filePath };
 }
 
 function lookupKeyForLocaleFile(locale, filePath, key) {
+  const prefix = locale.filePrefixes?.[filePath];
+  if (prefix !== undefined) {
+    if (!prefix) return key;
+    return key.startsWith(prefix + '.') ? key.slice(prefix.length + 1) : undefined;
+  }
   const isNestedLocaleFile = !locale.topLevelFiles?.includes(filePath) && normalizeFsPath(locale.path) !== normalizeFsPath(filePath);
   const stem = fileStem(filePath);
   if (isNestedLocaleFile && stem && stem !== 'index' && key.startsWith(stem + '.')) return key.slice(stem.length + 1);
@@ -771,6 +768,7 @@ export function getLocaleParamDiagnostics(locale, filePath, text, locales) {
     const consistency = getLocaleParamConsistency(key, locales);
     if (consistency.consistent) continue;
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, key);
+    if (lookupKey === undefined) continue;
     const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
     if (range) diagnostics.push(paramInconsistencyDiagnostic(key, range, consistency.perLocale));
   }
@@ -921,6 +919,7 @@ export function localeKeyAtPosition(locale, filePath, text, position) {
   let lineFallbackCount = 0;
   for (const fullKey of Object.keys(locale.flat)) {
     const lookupKey = lookupKeyForLocaleFile(locale, filePath, fullKey);
+    if (lookupKey === undefined) continue;
     const range = localeKeyRange(text, lookupKey, isJson, jsonRoot);
     if (!range || range.start.line !== position.line) continue;
     if (comparePosition(position, range.start) >= 0 && comparePosition(position, range.end) < 0) return fullKey;
@@ -1086,12 +1085,13 @@ function buildNestedProperty(parts, value, indent, unit, eol) {
 }
 
 
+// File and directory namespaces are applied by the loader, not the parser.
 export function parseTsLocaleModule(text, fileName = 'index.ts') {
   const result = {};
   const stem = fileName.replace(/\.[cm]?[tj]sx?$/i, '');
   const exportObject = extractObjectAfter(text, /export\s+default\s*/g);
   if (exportObject) {
-    Object.assign(result, flattenJsObjectLiteral(exportObject, stem === 'index' ? '' : stem));
+    Object.assign(result, flattenJsObjectLiteral(exportObject));
   }
 
   if (stem === 'index') {

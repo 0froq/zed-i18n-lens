@@ -220,6 +220,19 @@ src/locales/ja-JP/common.json
 
 A file named `common.json` contributes keys with the `common.` prefix. A file named `index.json` contributes keys without an `index.` prefix.
 
+Locale directories are scanned recursively. Subdirectories contribute to the namespace:
+
+```text
+src/locales/en-US/system/user.json       -> system.user.*
+src/locales/en-US/system/index.json      -> system.*
+src/locales/en-US/system/forms/fields.ts -> system.forms.fields.*
+src/locales/en-US/index/index.json       -> index.*
+```
+
+Nested JSON, TS, and JS locale files support translation previews, definition, references, and unsaved buffer updates. Adding files in nested directories refreshes translations automatically. Missing-key quick fixes retain the existing namespace directory layout when the target is unambiguous and its parent directory exists.
+
+If `localeDirs` overlap, an explicitly configured nested root is excluded from its ancestor's recursive scan, regardless of configuration order or nesting depth. For example, with `["locales", "locales/modules/features"]`, `locales/modules/features/en/user.json` belongs to locale `en` with keys `user.*`, not locale `modules`. Intermediate directories without locale files are watched for new files but do not count as locales. Empty locale files still count as locales and report missing keys.
+
 Top-level TS/JS modules such as `locales/en.ts` are also loaded, without adding an `en.` prefix. Directory modules such as `locales/en/common.ts` retain the `common.` prefix; `index.ts` has no file-stem prefix. Modules are parsed statically, never executed. Their definitions support Find References and cross-language parameter diagnostics, not source-code completions or inlay hints. TS/JS key positioning remains best-effort rather than a full syntax-tree analysis.
 
 ## Monorepo workspaces
