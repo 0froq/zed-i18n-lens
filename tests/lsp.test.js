@@ -24,6 +24,8 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
   const pending = new Map();
   const diagnostics = new Map();
   const waiters = new Set();
+  let initializedRefresh;
+  const ready = new Promise((resolve) => { initializedRefresh = resolve; });
   let serial = 0;
   let buffer = Buffer.alloc(0);
   let stderr = '';
@@ -42,6 +44,7 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
       const message = JSON.parse(buffer.subarray(headerEnd + 4, headerEnd + 4 + size).toString());
       buffer = buffer.subarray(headerEnd + 4 + size);
       if (message.method && message.id !== undefined) {
+        if (message.method === 'workspace/inlayHint/refresh') initializedRefresh();
         send({ id: message.id, result: null });
       } else if (message.id !== undefined) {
         const entry = pending.get(message.id);
@@ -117,7 +120,7 @@ async function startServer(t, files, settings = {}, workspaceEdit = { documentCh
     initializationOptions: { defaultLocale: 'en', ...settings },
   });
   send({ method: 'initialized', params: {} });
-  return { root, uri, call, open, change, configure, sync, send, diagnostics, actions, nextDiagnostics };
+  return { root, uri, call, open, change, configure, sync, send, diagnostics, actions, nextDiagnostics, ready };
 }
 
 function documentEdits(action) {
@@ -654,32 +657,112 @@ test('nested definitions follow the effective translation after merging and unsa
 });
 
 test('overlapping locale roots keep reverse references in the explicitly configured root', async (t) => {
-  for (const localeDirs of [['locales', 'locales/modules'], ['locales/modules', 'locales']]) {
-    await t.test(localeDirs.join(', '), async (t) => {
-      const source = "t('user.name')\nt('en.user.name')";
-      const localeFile = 'locales/modules/en/user.json';
+  const nestedRoots = ['locales/modules', 'locales/modules/features', 'locales/modules/features/messages'];
+  for (const nestedRoot of nestedRoots) {
+    for (const localeDirs of [['locales', nestedRoot], [nestedRoot, 'locales']]) {
+      await t.test(localeDirs.join(', '), async (t) => {
+        const source = "t('user.name')\nt('en.user.name')";
+        const localeFile = nestedRoot + '/en/user.json';
+        const s = await startServer(t, {
+          [localeFile]: '{"name":"User"}',
+          'src/app.ts': source,
+        }, { localeDirs });
+        await s.open('src/app.ts', source);
+        async function check() {
+          const references = await s.call('textDocument/references', localeFile, {
+            position: { line: 0, character: 3 }, context: { includeDeclaration: false },
+          });
+          const expected = await s.call('textDocument/references', 'src/app.ts', {
+            position, context: { includeDeclaration: false },
+          });
+          assert.deepEqual(references, expected);
+          assert.deepEqual(references.map((item) => item.range.start.line), [0]);
+          assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')).filter((item) => item.data.key === 'user.name'), []);
+          assert.doesNotMatch((await s.sync('src/app.ts')).contents.value, /\| modules \|/);
+        }
+        await check();
+        await s.open(localeFile, '{"name":"Opened"}');
+        await s.change(localeFile, '{"name":"Unsaved"}', 2);
+        assert.match((await s.sync('src/app.ts')).contents.value, /Unsaved/);
+        await check();
+      });
+    }
+  }
+});
+
+test('deeply overlapping roots retain empty locale files as real missing-key targets', async (t) => {
+  for (const emptyText of ['', '{}']) {
+    await t.test(JSON.stringify(emptyText), async (t) => {
+      const source = "t('user.name')";
       const s = await startServer(t, {
-        [localeFile]: '{"name":"User"}',
+        'locales/modules/features/en/user.json': '{"name":"User"}',
+        'locales/modules/features/zh/user.json': emptyText,
+        'src/app.ts': source,
+      }, { localeDirs: ['locales', 'locales/modules/features'] });
+      await s.open('src/app.ts', source);
+      const diagnostics = s.diagnostics.get(s.uri('src/app.ts'));
+      assert.equal(diagnostics.length, 1);
+      assert.deepEqual(diagnostics[0].data.missingLocales, ['zh']);
+      const [action] = await s.actions('src/app.ts');
+      assert.ok(action, 'an empty locale file remains a writable target');
+      const [edit] = documentEdits(action);
+      assert.equal(edit.textDocument.uri, s.uri('locales/modules/features/zh/user.json'));
+      const updated = applyText(emptyText, edit);
+      assert.deepEqual(JSON.parse(updated), { name: '' });
+      await s.open('locales/modules/features/zh/user.json', updated);
+      assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')), []);
+    });
+  }
+});
+
+test('deeply overlapping roots retain an ancestor locale that has its own file', async (t) => {
+  const source = "t('name')";
+  const s = await startServer(t, {
+    'locales/modules/features/en/index.json': '{"name":"User"}',
+    'locales/modules/index.json': '{}',
+    'src/app.ts': source,
+  }, { localeDirs: ['locales', 'locales/modules/features'] });
+  await s.open('src/app.ts', source);
+  const diagnostics = s.diagnostics.get(s.uri('src/app.ts'));
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(diagnostics[0].data.missingLocales, ['modules']);
+  const [action] = await s.actions('src/app.ts');
+  assert.ok(action);
+  const [edit] = documentEdits(action);
+  assert.equal(edit.textDocument.uri, s.uri('locales/modules/index.json'));
+  assert.deepEqual(JSON.parse(applyText('{}', edit)), { name: '' });
+});
+
+test('fileless intermediate directories stay watched as locales appear and disappear', { timeout: 45000 }, async (t) => {
+  const nestedRoot = 'locales/modules/features';
+  for (const localeDirs of [['locales', nestedRoot], [nestedRoot, 'locales']]) {
+    await t.test(localeDirs.join(', '), { timeout: 20000 }, async (t) => {
+      const source = "t('user.name')\nt('pending.deep.title')";
+      const s = await startServer(t, {
+        [nestedRoot + '/en/user.json']: '{"name":"User"}',
+        [nestedRoot + '/en/pending/deep/index.json']: '{"title":"Existing"}',
+        'locales/modules/pending/deep/.keep': '',
         'src/app.ts': source,
       }, { localeDirs });
+      // Wait for the initialized reload to install watchers before touching disk.
+      await s.ready;
       await s.open('src/app.ts', source);
-      async function check() {
-        const references = await s.call('textDocument/references', localeFile, {
-          position: { line: 0, character: 3 }, context: { includeDeclaration: false },
-        });
-        const expected = await s.call('textDocument/references', 'src/app.ts', {
-          position, context: { includeDeclaration: false },
-        });
-        assert.deepEqual(references, expected);
-        assert.deepEqual(references.map((item) => item.range.start.line), [0]);
-        assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')).filter((item) => item.data.key === 'user.name'), []);
-        assert.doesNotMatch((await s.sync('src/app.ts')).contents.value, /\| modules \|/);
+      assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')), []);
+      const file = path.join(s.root, 'locales/modules/pending/deep/index.json');
+      const titlePosition = { line: 1, character: 4 };
+      for (const title of ['Watched', 'Watched again']) {
+        const appeared = s.nextDiagnostics('src/app.ts', (items) => items.length === 1
+          && items[0].data.key === 'user.name' && items[0].data.missingLocales.join(',') === 'modules', 5000);
+        await fs.writeFile(file, JSON.stringify({ title }));
+        await appeared;
+        const hover = await s.call('textDocument/hover', 'src/app.ts', { position: titlePosition });
+        assert.ok(hover.contents.value.includes(`| modules | ${title} |`));
+        const disappeared = s.nextDiagnostics('src/app.ts', (items) => items.length === 0, 5000);
+        await fs.unlink(file);
+        await disappeared;
+        const after = await s.call('textDocument/hover', 'src/app.ts', { position: titlePosition });
+        assert.doesNotMatch(after.contents.value, /\| modules \|/);
       }
-      await check();
-      await s.open(localeFile, '{"name":"Opened"}');
-      await s.change(localeFile, '{"name":"Unsaved"}', 2);
-      assert.match((await s.sync('src/app.ts')).contents.value, /Unsaved/);
-      await check();
     });
   }
 });

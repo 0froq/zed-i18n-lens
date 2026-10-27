@@ -583,6 +583,12 @@ test('collectLocaleWatchPaths includes locale directories and loaded locale file
   ]);
 });
 
+test('collectLocaleWatchPaths keeps fileless discovery directories without locale records', () => {
+  assert.deepEqual(collectLocaleWatchPaths({}, [
+    '/repo/locales', '/repo/locales/modules', '/repo/locales/modules/pending', '/repo/locales/modules',
+  ]), ['/repo/locales', '/repo/locales/modules', '/repo/locales/modules/pending']);
+});
+
 test('didWatchedFileChange detects mtime changes and ignores unchanged files', () => {
   assert.equal(didWatchedFileChange({ mtimeMs: 10 }, { mtimeMs: 10 }), false);
   assert.equal(didWatchedFileChange({ mtimeMs: 10 }, { mtimeMs: 11 }), true);

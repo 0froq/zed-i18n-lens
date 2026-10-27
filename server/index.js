@@ -377,7 +377,7 @@ function watchLocalePaths() {
       .map((dir) => path.join(context.root, dir))
       .filter((dir) => fs.existsSync(dir));
     const loaded = loadLocalesForContext(context);
-    for (const watchPath of collectLocaleWatchPaths(loaded.locales, configuredDirs)) nextPaths.add(watchPath);
+    for (const watchPath of collectLocaleWatchPaths(loaded.locales, [...configuredDirs, ...loaded.watchDirectories])) nextPaths.add(watchPath);
   }
 
   for (const watchedPath of watchedLocalePaths) {
@@ -650,38 +650,39 @@ function loadLocalesForContext(context) {
 
   const locales = {};
   const localeTexts = {};
+  const watchDirectories = new Set();
   const localeRoots = context.config.localeDirs.map((dir) => path.resolve(context.root, dir));
   for (const fullDir of localeRoots) {
     if (!fs.existsSync(fullDir)) continue;
     loadLocaleFiles(fullDir, locales, localeTexts);
     for (const entry of fs.readdirSync(fullDir, { withFileTypes: true })) {
-      if (entry.isDirectory()) loadLocaleDirectory(path.join(fullDir, entry.name), entry.name, locales, localeTexts, localeRoots);
+      if (entry.isDirectory()) loadLocaleDirectory(path.join(fullDir, entry.name), entry.name, locales, localeTexts, localeRoots, watchDirectories);
     }
   }
-  const loaded = { locales, localeTexts };
+  const loaded = { locales, localeTexts, watchDirectories: [...watchDirectories] };
   localeCacheByContext.set(cacheKey, loaded);
   return loaded;
 }
 
-function loadLocaleDirectory(localeDir, localeName, next, localeTexts, localeRoots, rootDir = localeDir) {
+function loadLocaleDirectory(localeDir, localeName, next, localeTexts, localeRoots, watchDirectories, rootDir = localeDir) {
   // An explicit locale root owns its subtree, independently of config order.
   if (localeRoots.includes(localeDir)) return;
-  next[localeName] ||= { path: localeDir, flat: {}, keyFiles: {}, files: [] };
-  const locale = next[localeName];
-  locale.directories ||= [];
-  if (!locale.directories.includes(rootDir)) locale.directories.push(rootDir);
-  locale.watchDirectories ||= [];
-  if (!locale.watchDirectories.includes(localeDir)) locale.watchDirectories.push(localeDir);
-  locale.filePrefixes ||= {};
+  // Fileless directories still need watching, but must not create phantom locales.
+  watchDirectories.add(localeDir);
   for (const entry of fs.readdirSync(localeDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     const file = entry.name;
     const fullPath = path.join(localeDir, file);
     if (entry.isDirectory()) {
-      loadLocaleDirectory(fullPath, localeName, next, localeTexts, localeRoots, rootDir);
+      loadLocaleDirectory(fullPath, localeName, next, localeTexts, localeRoots, watchDirectories, rootDir);
       continue;
     }
     if (!LOCALE_FILE_RE.test(file)) continue;
     if (entry.isSymbolicLink() && fs.statSync(fullPath).isDirectory()) continue;
+    next[localeName] ||= { path: rootDir, flat: {}, keyFiles: {}, files: [] };
+    const locale = next[localeName];
+    locale.directories ||= [];
+    if (!locale.directories.includes(rootDir)) locale.directories.push(rootDir);
+    locale.filePrefixes ||= {};
     const relativeFile = path.relative(rootDir, fullPath);
     if (!locale.files.includes(fullPath)) locale.files.push(fullPath);
     locale.filePrefixes[fullPath] = localeFilePrefix(relativeFile);

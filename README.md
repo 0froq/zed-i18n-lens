@@ -231,7 +231,7 @@ src/locales/en-US/index/index.json       -> index.*
 
 Nested JSON, TS, and JS locale files support translation previews, definition, references, and unsaved buffer updates. Adding files in nested directories refreshes translations automatically. Missing-key quick fixes retain the existing namespace directory layout when the target is unambiguous and its parent directory exists.
 
-If `localeDirs` overlap, an explicitly configured nested root is excluded from its ancestor's recursive scan, regardless of configuration order. For example, with `["locales", "locales/modules"]`, `locales/modules/en/user.json` belongs to locale `en` with keys `user.*`, not locale `modules` with keys `en.user.*`.
+If `localeDirs` overlap, an explicitly configured nested root is excluded from its ancestor's recursive scan, regardless of configuration order or nesting depth. For example, with `["locales", "locales/modules/features"]`, `locales/modules/features/en/user.json` belongs to locale `en` with keys `user.*`, not locale `modules`. Intermediate directories without locale files are watched for new files but do not count as locales. Empty locale files still count as locales and report missing keys.
 
 Top-level TS/JS modules such as `locales/en.ts` are also loaded, without adding an `en.` prefix. Directory modules such as `locales/en/common.ts` retain the `common.` prefix; `index.ts` has no file-stem prefix. Modules are parsed statically, never executed. Their definitions support Find References and cross-language parameter diagnostics, not source-code completions or inlay hints. TS/JS key positioning remains best-effort rather than a full syntax-tree analysis.
 

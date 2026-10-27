@@ -635,7 +635,6 @@ export function collectLocaleWatchPaths(localeCache, localeDirs = []) {
   const paths = new Set(localeDirs.filter(Boolean));
   for (const locale of Object.values(localeCache || {})) {
     if (locale.path) paths.add(locale.path);
-    for (const directory of locale.watchDirectories || []) paths.add(directory);
     for (const file of locale.files || []) paths.add(file);
   }
   return [...paths].sort();
