@@ -827,6 +827,30 @@ export function getParamCodeActions(text, diagnostics = []) {
 }
 
 /**
+ * If [contentStart, contentEnd) is translatable text inside a static attribute
+ * value or a bound attribute's whole string literal, returns safe rewrite bounds.
+ */
+function attributeLiteralContext(text, contentStart, contentEnd) {
+  const before = text.slice(0, contentStart);
+  const after = text.slice(contentEnd);
+  let bound = /(?:^|[\s>])(?::|v-bind:)([\w-]+)\s*=\s*(["'])\s*(['"]?)\s*$/.exec(before);
+  let plain = !bound && /(?:^|[\s>])([\w-]+)\s*=\s*(["'])\s*$/.exec(before);
+  const m = bound || plain;
+  if (!m) return null;
+  const name = m[1];
+  const openQuote = bound ? bound[2] : plain[2];
+  const innerQuote = bound?.[3] || '';
+  const closeRe = innerQuote
+    ? new RegExp(`^\\s*${escapeRegExp(innerQuote)}\\s*${escapeRegExp(openQuote)}`)
+    : new RegExp(`^\\s*${escapeRegExp(openQuote)}`);
+  const closeMatch = closeRe.exec(after);
+  if (!closeMatch) return null;
+  const attrStart = contentStart - m[0].length + m[0].search(/\S/);
+  const attrEnd = contentEnd + closeMatch[0].length;
+  return { name, openQuote, innerQuote, attrStart, attrEnd };
+}
+
+/**
  * "Extract to i18n key" for raw-text diagnostics (or raw text inside a selected
  * range). Key = `<prefix>.<slug>` where the prefix comes from deriveKeyPrefix
  * (nearest ancestor keys > file keys > file stem); always a new key (identical
@@ -852,13 +876,10 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     if (!value || /[&<>{}]/.test(value)) return [];
     const { prefix, source: keySource } = deriveKeyPrefix(text, language, filePath, s, e, defaultFlat);
     const key = uniqueKey(prefix + '.' + slugify(value), defaultFlat);
-    const attr = /\s((?::|v-bind:)?)([\w-]+)\s*=\s*(["'])(["']?)$/.exec(text.slice(0, s));
+    const attr = attributeLiteralContext(text, s, e);
     let edit;
     if (attr) {
-      const close = attr[4] + attr[3];
-      if (text.slice(e, e + close.length) !== close) return [];
-      const attrStart = s - attr[0].length + 1;
-      edit = { range: makeRange(text, attrStart, e + close.length), newText: `:${attr[2]}="$t('${key}')"` };
+      edit = { range: makeRange(text, attr.attrStart, attr.attrEnd), newText: `:${attr.name}="$t('${key}')"` };
     } else {
       edit = { range: makeRange(text, s, e), newText: `{{ $t('${key}') }}` };
     }
@@ -991,16 +1012,26 @@ export function getInlineCodeActions(text, range, locales = {}) {
   const after = text.slice(end);
   const interp = /\{\{\s*$/.exec(before);
   const interpEnd = /^\s*\}\}/.exec(after);
-  const attr = /\s(?::|v-bind:)([\w-]+)\s*=\s*(["'])\s*$/.exec(before);
+  const attr = attributeLiteralContext(text, start, end);
+  const inAttributeValue = /\s(?::|v-bind:)?[\w-]+\s*=\s*["']/.test(before) && /["']/.test(after);
+  if (inAttributeValue && !attr) return [];
   return Object.entries(locales).flatMap(([name, locale]) => {
     const value = locale?.flat?.[item.key];
     if (typeof value !== 'string') return [];
     let edit;
     if (interp && interpEnd) {
       edit = { range: makeRange(text, start - interp[0].length, end + interpEnd[0].length), newText: escapeHtml(value) };
-    } else if (attr && after.trimStart().startsWith(attr[2])) {
-      const close = after.indexOf(attr[2]) + 1;
-      edit = { range: makeRange(text, start - attr[0].length + 1, end + close), newText: `${attr[1]}="${escapeHtml(value)}"` };
+    } else if (attr) {
+      const jsQuote = attr.innerQuote || "'";
+      const escaped = value
+        .replace(/\\/g, '\\\\')
+        .replace(new RegExp(jsQuote, 'g'), '\\' + jsQuote)
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n');
+      const boundLiteral = attr.innerQuote
+        ? `:${attr.name}=${attr.openQuote}${attr.innerQuote}${escaped}${attr.innerQuote}${attr.openQuote}`
+        : `${attr.name}="${escapeHtml(value)}"`;
+      edit = { range: makeRange(text, attr.attrStart, attr.attrEnd), newText: boundLiteral };
     } else {
       const escaped = value.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
       edit = { range: makeRange(text, start, end), newText: quote + escaped + quote };

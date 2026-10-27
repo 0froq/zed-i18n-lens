@@ -25,6 +25,20 @@ test('extract rewrites bound string literal attributes', () => {
   assert.equal(apply(text, action.edit), `<template><input :placeholder="$t('LoginForm.your_name')"></template>`);
 });
 
+test('extract rewrites static attributes with surrounding whitespace', () => {
+  const text = '<template><input title = "  Hello world  "></template>';
+  const [action] = extract(text);
+  assert.equal(action.value, 'Hello world');
+  assert.equal(apply(text, action.edit), `<template><input :title="$t('LoginForm.hello_world')"></template>`);
+});
+
+test('extract rewrites padded bound string literal attributes', () => {
+  const text = `<template><input :placeholder=" 'Enter name' "></template>`;
+  const [action] = extract(text);
+  assert.equal(action.value, 'Enter name');
+  assert.equal(apply(text, action.edit), `<template><input :placeholder="$t('LoginForm.enter_name')"></template>`);
+});
+
 test('extract always creates a file-stem key (no reuse) and avoids collisions', () => {
   const text = '<template><b>Hello world</b></template>';
   assert.equal(extract(text, { 'common.hello': 'Hello world' })[0].key, 'LoginForm.hello_world');
@@ -36,17 +50,6 @@ test('extract skips interpolation/entities and hashes non-Latin text', () => {
   const parts = extract('<template><p>Hi {{ name }} there friend</p></template>');
   assert.deepEqual(parts.map((a) => a.value), ['there friend']);
   assert.match(extract('<template><p>你好世界</p></template>')[0].key, /^LoginForm\.text_[0-9a-f]+$/);
-});
-
-test('extract accepts lowercase, all-caps and short words', () => {
-  for (const word of ['save', 'OK', 'Go', 'userName']) {
-    const text = `<template><p>${word}</p></template>`;
-    const p = { line: 0, character: text.indexOf(word) + 1 };
-    assert.equal(extract(text, {}, { start: p, end: p })[0]?.value, word, word);
-  }
-  const url = '<template><p>https://example.com</p></template>';
-  const q = { line: 0, character: 16 };
-  assert.deepEqual(extract(url, {}, { start: q, end: q }), []);
 });
 
 test('extract accepts lowercase, all-caps and short words', () => {
@@ -94,6 +97,17 @@ test('inline skips calls with params or outside a call', () => {
   const text = "t('greet', { n: 1 }); x";
   assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
   assert.deepEqual(getInlineCodeActions(text, { start: { line: 0, character: text.length } }, locales), []);
+});
+
+test('inline skips partial attribute expressions', () => {
+  const text = `<template><div :title="$t('greet') + ' suffix'"></div></template>`;
+  assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
+});
+
+test('inline escapes quotes when rewriting bound attribute values', () => {
+  const text = `<template><div :aria-label="$t('greet')"></div></template>`;
+  const [action] = getInlineCodeActions(text, at(text, 'greet'), locales);
+  assert.equal(apply(text, action.edit), '<template><div aria-label="Say &quot;hi&quot; &lt;now&gt;"></div></template>');
 });
 
 test('extract key prefix comes from the nearest ancestor with keys', () => {
