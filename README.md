@@ -13,6 +13,7 @@ Zed extension plus Language Server for Vue, TypeScript, TSX, JavaScript and JSX.
 - Completion: suggest existing i18n keys with default locale text only inside supported i18n key positions
 - Definition: jump from a source key to its locale definition; when several locales define the key, pick which language file to open
 - References: from a locale definition or source usage, find references within the same project/package context, including open source files not yet saved to disk
+- Recursive locale directories: nested JSON, TS, and JS files map to dot-separated namespaces, with `index` files contributing to their parent namespace
 
 ## Installation
 

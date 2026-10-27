@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it is developed locally.
 
+## [0.14.0] - 2026-10-27
+
+### Added
+
+- Recursive locale directory discovery: JSON, TS, and JS files in nested directories map to namespaces from their relative path, so `locales/en/system/user.json` contributes `system.user.*` and `locales/en/system/forms/fields.ts` contributes `system.forms.fields.*`. An `index` file contributes to its parent namespace, so `locales/en/system/index.json` contributes `system.*`; a real `index/` directory contributes `index.*`.
+- Nested locale files support inline translations, definition, references, and unsaved buffer updates.
+- Locale files created in nested or still-empty directories are picked up automatically, and removing them restores the previous diagnostics, without restarting the language server.
+- Missing-key quick fixes reuse an unambiguous sibling locale directory layout when the target file and its parent directory exist or can be created.
+
+### Fixed
+
+- TS and JS locale modules now keep the default export authoritative. A non-`index` module is no longer parsed as an `index` module, so file-local helper objects can no longer override default-export values or be reported as translations.
+- A root `<locale>/index.json` is now distinguished from an `index/` namespace directory. Creating a missing key under `index.*` writes it into the namespace file instead of nesting another `index` object, and the root file is left untouched.
+- Definition and declaration references now follow the file that actually supplied the winning value when several files define the same key, instead of preferring the file with the more specific namespace prefix.
+- Overlapping `localeDirs` no longer create phantom locales. An explicitly configured nested root is excluded from its ancestor's scan regardless of configuration order or nesting depth, and a directory that holds no locale file no longer participates in missing-key diagnostics while it remains watched for new files.
+
+### Changed
+
+- Bumped extension/package/Cargo version from `0.13.0` to `0.14.0`.
+
 ## [0.13.0] - 2026-10-04
 
 ### Added

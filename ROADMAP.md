@@ -10,7 +10,7 @@
 
 ## 当前状态
 
-当前已具备（截至 v0.13.0）：
+当前已具备（截至 v0.14.0）：
 
 - Zed Dev Extension 可加载
 - Language Server 可通过 `--stdio` 启动
@@ -19,6 +19,7 @@
 - 支持 locale 形态：
   - `src/locales/*.json`、`src/i18n/*.json`、`locales/*.json`、`i18n/*.json`
   - 目录式：`src/locales/<locale>/<ns>.json`（按文件名加命名空间前缀）
+  - 多层目录：`src/locales/<locale>/system/user.json` → `system.user.*`（`index` 文件归入父命名空间）
   - TypeScript locale module：`<locale>.ts`（`export default {}` / `export const`，不执行用户代码）
 - 支持能力：
   - Inlay Hints 行内显示默认语言翻译
@@ -26,11 +27,11 @@
   - Diagnostics：全缺为 error，部分语言缺失为 warning，并校验 interpolation params 缺失/多余
   - Completion 补全已有 i18n key
   - Definition 跳转到 locale 定义，多语言时返回每个语言的位置供选择
-  - Code Action：添加缺失 / 移除多余 interpolation params；在单文件及目录式 JSON locale 中安全创建缺失 key，支持依据已有 namespace 布局创建目标文件
+  - Code Action：添加缺失 / 移除多余 interpolation params；在单文件及目录式 JSON locale 中安全创建缺失 key，支持依据已有 namespace 布局及多层目录创建目标文件
   - References：从源码或 JSON/TS locale 定义查引用，隔离独立子包并包含尚未落盘的打开源码
   - 编辑安全：读取未保存 locale，版本化最小编辑，拒绝歧义 JSON 路径及目录路由；注释 / 普通字符串降噪，补全限制在 i18n key 上下文
 - 项目配置 `.zed/i18nlensrc.json`（`defaultLocale` / `localeDirs` / `inlayHints`），支持 monorepo `packages` 多上下文
-- 自动化验证：`npm test`（纯函数 + 真实 stdio LSP 回归），以及实际应用 WorkspaceEdit 后观察 locale 刷新与诊断消失的烟测
+- 自动化验证：`npm test`（纯函数 + 真实 stdio LSP 回归，共 135 项），以及实际应用 WorkspaceEdit 后观察 locale 刷新与诊断消失的烟测
 - Zed extension 编译验证：`cargo check --target wasm32-wasip1`
 
 ---
