@@ -220,7 +220,7 @@ function getCreateKeyActions(diagnostics, context) {
   return actions;
 }
 
-// Namespace routing follows loaded file stems. Index-owned prefixes and
+// Namespace routing follows loaded file prefixes. Index-owned prefixes and
 // overlapping layouts are not guessed; ambiguous targets disable the action.
 function planKeyInsertion(key, locale, locales, localeTexts) {
   if (!locale) return undefined;
@@ -231,10 +231,10 @@ function planKeyInsertion(key, locale, locales, localeTexts) {
   }
   if (locale.directories.length !== 1 || locale.topLevelFiles?.length) return undefined;
   const directory = locale.directories[0];
-  const targets = filesByStem(locale);
-  const namespaceFiles = [...targets.keys()].filter((stem) => stem !== 'index' && key.startsWith(stem + '.'));
+  const targets = filesByPrefix(locale);
+  const namespaceFiles = [...targets.keys()].filter((prefix) => prefix && key.startsWith(prefix + '.'));
   if (namespaceFiles.length > 1 || targets.has(key)) return undefined;
-  const indexFiles = targets.get('index') || [];
+  const indexFiles = targets.get('') || [];
   const indexFile = indexFiles.length === 1 && /\.json$/i.test(indexFiles[0]) ? indexFiles[0] : undefined;
   let indexOwnsPrefix = false;
   if (indexFiles.length) {
@@ -259,8 +259,8 @@ function planKeyInsertion(key, locale, locales, localeTexts) {
   const siblingStems = new Map();
   for (const sibling of Object.values(locales)) {
     if (sibling === locale || sibling.directories?.length !== 1 || sibling.topLevelFiles?.length) continue;
-    for (const [stem, files] of filesByStem(sibling)) {
-      if (stem === 'index' || !key.startsWith(stem + '.')) continue;
+    for (const [stem, files] of filesByPrefix(sibling)) {
+      if (!stem || !key.startsWith(stem + '.')) continue;
       siblingStems.set(stem, (siblingStems.get(stem) || []).concat(files.map((file) => ({
         file,
         relativePath: path.relative(sibling.directories[0], file),
@@ -280,15 +280,14 @@ function planKeyInsertion(key, locale, locales, localeTexts) {
   return indexFile ? insertInto(indexFile, key) : undefined;
 }
 
-function filesByStem(locale) {
-  const stems = new Map();
+function filesByPrefix(locale) {
+  const prefixes = new Map();
   for (const file of locale.files || []) {
-    const prefix = locale.filePrefixes?.[file];
-    const stem = prefix === undefined ? path.basename(file, path.extname(file)) : (prefix || 'index');
-    if (!stems.has(stem)) stems.set(stem, []);
-    stems.get(stem).push(file);
+    const prefix = locale.filePrefixes[file];
+    if (!prefixes.has(prefix)) prefixes.set(prefix, []);
+    prefixes.get(prefix).push(file);
   }
-  return stems;
+  return prefixes;
 }
 
 function insertInto(filePath, lookupKey) {
@@ -651,12 +650,12 @@ function loadLocalesForContext(context) {
 
   const locales = {};
   const localeTexts = {};
-  for (const dir of context.config.localeDirs) {
-    const fullDir = path.join(context.root, dir);
+  const localeRoots = context.config.localeDirs.map((dir) => path.resolve(context.root, dir));
+  for (const fullDir of localeRoots) {
     if (!fs.existsSync(fullDir)) continue;
     loadLocaleFiles(fullDir, locales, localeTexts);
     for (const entry of fs.readdirSync(fullDir, { withFileTypes: true })) {
-      if (entry.isDirectory()) loadLocaleDirectory(path.join(fullDir, entry.name), entry.name, locales, localeTexts);
+      if (entry.isDirectory()) loadLocaleDirectory(path.join(fullDir, entry.name), entry.name, locales, localeTexts, localeRoots);
     }
   }
   const loaded = { locales, localeTexts };
@@ -664,8 +663,10 @@ function loadLocalesForContext(context) {
   return loaded;
 }
 
-function loadLocaleDirectory(localeDir, localeName, next, localeTexts, rootDir = localeDir) {
-  next[localeName] ||= { path: localeDir, flat: {}, files: [] };
+function loadLocaleDirectory(localeDir, localeName, next, localeTexts, localeRoots, rootDir = localeDir) {
+  // An explicit locale root owns its subtree, independently of config order.
+  if (localeRoots.includes(localeDir)) return;
+  next[localeName] ||= { path: localeDir, flat: {}, keyFiles: {}, files: [] };
   const locale = next[localeName];
   locale.directories ||= [];
   if (!locale.directories.includes(rootDir)) locale.directories.push(rootDir);
@@ -676,7 +677,7 @@ function loadLocaleDirectory(localeDir, localeName, next, localeTexts, rootDir =
     const file = entry.name;
     const fullPath = path.join(localeDir, file);
     if (entry.isDirectory()) {
-      loadLocaleDirectory(fullPath, localeName, next, localeTexts, rootDir);
+      loadLocaleDirectory(fullPath, localeName, next, localeTexts, localeRoots, rootDir);
       continue;
     }
     if (!LOCALE_FILE_RE.test(file)) continue;
@@ -688,9 +689,12 @@ function loadLocaleDirectory(localeDir, localeName, next, localeTexts, rootDir =
       const text = localeText(fullPath);
       if (text === undefined) continue;
       localeTexts[fullPath] = text;
-      if (file.endsWith('.json')) Object.assign(locale.flat, prefixByFile(relativeFile, flattenLocale(JSON.parse(text))));
-      else if (/\.[cm]?[tj]s$/i.test(file)) Object.assign(locale.flat, prefixByFile(relativeFile, parseTsLocaleModule(text, 'index.ts')));
-      else continue;
+      const flat = prefixByFile(relativeFile, file.endsWith('.json')
+        ? flattenLocale(JSON.parse(text)) : parseTsLocaleModule(text, file));
+      for (const [key, value] of Object.entries(flat)) {
+        locale.flat[key] = value;
+        locale.keyFiles[key] = fullPath;
+      }
     } catch (error) { connection.console.warn('Failed to load locale file ' + fullPath + ': ' + error.message); }
   }
 }
@@ -714,7 +718,7 @@ function loadLocaleFiles(fullDir, next, localeTexts) {
       const isModule = /\.[cm]?[tj]s$/i.test(file);
       if (!isJson && !isModule) continue;
       const name = file.replace(/\.(json|[cm]?[tj]s)$/i, '');
-      next[name] ||= { path: fullPath, flat: {}, files: [], topLevelFiles: [] };
+      next[name] ||= { path: fullPath, flat: {}, keyFiles: {}, files: [], topLevelFiles: [] };
       next[name].filePrefixes ||= {};
       next[name].filePrefixes[fullPath] = '';
       next[name].topLevelFiles ||= [];
@@ -724,7 +728,10 @@ function loadLocaleFiles(fullDir, next, localeTexts) {
       if (text === undefined) continue;
       localeTexts[fullPath] = text;
       const flat = isJson ? flattenLocale(JSON.parse(text)) : parseTsLocaleModule(text, 'index.ts');
-      Object.assign(next[name].flat, flat);
+      for (const [key, value] of Object.entries(flat)) {
+        next[name].flat[key] = value;
+        next[name].keyFiles[key] = fullPath;
+      }
     } catch (error) { connection.console.warn('Failed to load locale file ' + fullPath + ': ' + error.message); }
   }
 }

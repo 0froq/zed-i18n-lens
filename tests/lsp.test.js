@@ -549,3 +549,137 @@ test('new files in nested locale directories automatically refresh translations'
   assert.match((await s.sync('src/app.ts')).contents.value, /Saved/);
   assert.deepEqual((await s.call('textDocument/inlayHint', 'src/app.ts', { range })).map((hint) => hint.label), ['Saved']);
 });
+
+test('non-index TS and JS locales preserve default exports without exposing helpers', async (t) => {
+  for (const file of ['common.ts', 'common.js', 'system/common.ts', 'system/common.js']) {
+    await t.test(file, async (t) => {
+      const prefix = file.replace(/\.[^.]+$/, '').replace(/\//g, '.');
+      const source = `t('${prefix}.button.save')\nt('${prefix}.internal.debug')`;
+      const module = "const button = { save: 'Save' };\nconst internal = { debug: 'Debug only' };\nexport default { button: { save: 'Save changes' } };";
+      const s = await startServer(t, { ['locales/en/' + file]: module, 'src/app.ts': source });
+      await s.open('src/app.ts', source);
+      const hints = await s.call('textDocument/inlayHint', 'src/app.ts', { range });
+      assert.deepEqual(hints.map((hint) => hint.label), ['Save changes']);
+      assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')).map((item) => item.data.key), [`${prefix}.internal.debug`]);
+      await s.open('src/completion.ts', `t('${prefix}.`);
+      const completions = await s.call('textDocument/completion', 'src/completion.ts', {
+        position: { line: 0, character: prefix.length + 4 },
+      });
+      assert.deepEqual(completions.map((item) => item.label), [`${prefix}.button.save`]);
+    });
+  }
+});
+
+test('index-directory creation strips its namespace and preserves the root index', async (t) => {
+  for (const withRootIndex of [false, true]) {
+    await t.test(`root index: ${withRootIndex}`, async (t) => {
+      const source = "t('index.submit')";
+      const files = { 'src/app.ts': source };
+      for (const locale of ['en', 'zh']) {
+        files[`locales/${locale}/index/index.json`] = '{"name":"Home"}';
+        if (withRootIndex) files[`locales/${locale}/index.json`] = '{"home":"Keep me"}';
+      }
+      const s = await startServer(t, files);
+      for (const locale of ['en', 'zh']) {
+        const name = `locales/${locale}/index/index.json`;
+        await s.open(name, files[name]);
+      }
+      await s.open('src/app.ts', source);
+      const [action] = await s.actions('src/app.ts');
+      assert.ok(action, 'the index namespace has an unambiguous creation target');
+      const edits = documentEdits(action);
+      assert.deepEqual(edits.map((edit) => edit.textDocument.uri).sort(),
+        ['en', 'zh'].map((locale) => s.uri(`locales/${locale}/index/index.json`)).sort());
+      for (const edit of edits) {
+        const name = path.relative(s.root, fileURLToPath(edit.textDocument.uri));
+        const original = await fs.readFile(fileURLToPath(edit.textDocument.uri), 'utf8');
+        const updated = applyText(original, edit);
+        assert.deepEqual(JSON.parse(updated), { name: 'Home', submit: '' });
+        await s.change(name, updated, 2);
+      }
+      assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')), []);
+      if (withRootIndex) {
+        for (const locale of ['en', 'zh']) {
+          assert.equal(await fs.readFile(path.join(s.root, `locales/${locale}/index.json`), 'utf8'), '{"home":"Keep me"}');
+        }
+      }
+    });
+  }
+});
+
+test('a missing index-directory file follows the sibling locale layout', async (t) => {
+  const source = "t('index.submit')";
+  const s = await startServer(t, {
+    'locales/en/index/index.json': '{"submit":"Submit"}',
+    'locales/zh/index/other.json': '{"name":"其他"}',
+    'src/app.ts': source,
+  });
+  await s.open('src/app.ts', source);
+  const [action] = await s.actions('src/app.ts');
+  assert.ok(action);
+  assert.equal(action.edit.documentChanges[0].kind, 'create');
+  assert.equal(action.edit.documentChanges[0].uri, s.uri('locales/zh/index/index.json'));
+  const [edit] = documentEdits(action);
+  assert.deepEqual(JSON.parse(applyText('', edit)), { submit: '' });
+});
+
+test('nested definitions follow the effective translation after merging and unsaved edits', async (t) => {
+  for (const file of ['system.user.json', 'system/user.json']) {
+    await t.test(file, async (t) => {
+      const source = "t('system.user.name')";
+      const owner = 'locales/en/' + file;
+      const index = 'locales/en/system/index.json';
+      const s = await startServer(t, {
+        [index]: '{"user":{"name":"Shadow"}}',
+        [owner]: '{"name":"Actual"}',
+        'src/app.ts': source,
+      });
+      await s.open('src/app.ts', source);
+      async function check(text, expectedFile) {
+        assert.match((await s.sync('src/app.ts')).contents.value, new RegExp(text));
+        const definitions = await s.call('textDocument/definition', 'src/app.ts', { position });
+        assert.deepEqual(definitions.map((item) => item.uri), [s.uri(expectedFile)]);
+        const references = await s.call('textDocument/references', 'src/app.ts', {
+          position, context: { includeDeclaration: true },
+        });
+        assert.deepEqual(references.filter((item) => item.uri !== s.uri('src/app.ts')).map((item) => item.uri), [s.uri(expectedFile)]);
+      }
+      await check('Actual', owner);
+      await s.open(owner, '{}');
+      await check('Shadow', index);
+      s.send({ method: 'textDocument/didClose', params: { textDocument: { uri: s.uri(owner) } } });
+      await check('Actual', owner);
+    });
+  }
+});
+
+test('overlapping locale roots keep reverse references in the explicitly configured root', async (t) => {
+  for (const localeDirs of [['locales', 'locales/modules'], ['locales/modules', 'locales']]) {
+    await t.test(localeDirs.join(', '), async (t) => {
+      const source = "t('user.name')\nt('en.user.name')";
+      const localeFile = 'locales/modules/en/user.json';
+      const s = await startServer(t, {
+        [localeFile]: '{"name":"User"}',
+        'src/app.ts': source,
+      }, { localeDirs });
+      await s.open('src/app.ts', source);
+      async function check() {
+        const references = await s.call('textDocument/references', localeFile, {
+          position: { line: 0, character: 3 }, context: { includeDeclaration: false },
+        });
+        const expected = await s.call('textDocument/references', 'src/app.ts', {
+          position, context: { includeDeclaration: false },
+        });
+        assert.deepEqual(references, expected);
+        assert.deepEqual(references.map((item) => item.range.start.line), [0]);
+        assert.deepEqual(s.diagnostics.get(s.uri('src/app.ts')).filter((item) => item.data.key === 'user.name'), []);
+        assert.doesNotMatch((await s.sync('src/app.ts')).contents.value, /\| modules \|/);
+      }
+      await check();
+      await s.open(localeFile, '{"name":"Opened"}');
+      await s.change(localeFile, '{"name":"Unsaved"}', 2);
+      assert.match((await s.sync('src/app.ts')).contents.value, /Unsaved/);
+      await check();
+    });
+  }
+});

@@ -643,23 +643,14 @@ export function collectLocaleWatchPaths(localeCache, localeDirs = []) {
 
 export function findLocaleKeyTarget(locale, key, localeTexts = {}) {
   if (!locale || !Object.prototype.hasOwnProperty.call(locale.flat || {}, key)) return undefined;
-  const files = Array.isArray(locale.files) && locale.files.length
-    ? locale.files
-    : (locale.path ? [locale.path] : []);
-  const candidates = files
-    .map((filePath) => ({ filePath, lookupKey: lookupKeyForLocaleFile(locale, filePath, key) }))
-    .filter((candidate) => candidate.lookupKey !== undefined)
-    .sort((a, b) => Number(a.lookupKey === key) - Number(b.lookupKey === key));
-
-  for (const candidate of candidates) {
-    const text = localeTexts[candidate.filePath];
-    if (!text) continue;
-    const range = localeKeyRange(text, candidate.lookupKey, /\.json$/i.test(candidate.filePath));
-    if (range) return { filePath: candidate.filePath, position: range.start, range };
-  }
-
-  const fallback = candidates[0];
-  return fallback ? { filePath: fallback.filePath } : undefined;
+  // Namespace specificity does not determine which file won during loading.
+  const filePath = locale.keyFiles?.[key];
+  if (!filePath) return undefined;
+  const lookupKey = lookupKeyForLocaleFile(locale, filePath, key);
+  if (lookupKey === undefined) return undefined;
+  const text = localeTexts[filePath];
+  const range = text ? localeKeyRange(text, lookupKey, /\.json$/i.test(filePath)) : undefined;
+  return range ? { filePath, position: range.start, range } : { filePath };
 }
 
 function lookupKeyForLocaleFile(locale, filePath, key) {
@@ -1095,12 +1086,13 @@ function buildNestedProperty(parts, value, indent, unit, eol) {
 }
 
 
+// File and directory namespaces are applied by the loader, not the parser.
 export function parseTsLocaleModule(text, fileName = 'index.ts') {
   const result = {};
   const stem = fileName.replace(/\.[cm]?[tj]sx?$/i, '');
   const exportObject = extractObjectAfter(text, /export\s+default\s*/g);
   if (exportObject) {
-    Object.assign(result, flattenJsObjectLiteral(exportObject, stem === 'index' ? '' : stem));
+    Object.assign(result, flattenJsObjectLiteral(exportObject));
   }
 
   if (stem === 'index') {

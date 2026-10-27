@@ -22,6 +22,7 @@ import {
   collectLocaleWatchPaths,
   findJsonKeyLocation,
   insertNestedJsonKey,
+  parseTsLocaleModule,
   findLocaleKeyTarget,
   collectLocaleKeyTargets,
   localeKeyAtPosition,
@@ -369,6 +370,7 @@ test('findLocaleKeyTarget resolves keys inside prefixed locale directory files',
   const locale = {
     path: '/repo/src/locales/zh-CN',
     flat: { 'common.ok': '确定' },
+    keyFiles: { 'common.ok': '/repo/src/locales/zh-CN/common.json' },
     files: ['/repo/src/locales/zh-CN/common.json'],
   };
   const localeTexts = {
@@ -382,8 +384,14 @@ test('findLocaleKeyTarget resolves keys inside prefixed locale directory files',
 
 test('collectLocaleKeyTargets returns every locale that defines the key, default locale first', () => {
   const locales = {
-    'en-US': { path: '/repo/src/locales/en-US.json', flat: { 'common.ok': 'OK' }, files: ['/repo/src/locales/en-US.json'] },
-    'zh-CN': { path: '/repo/src/locales/zh-CN', flat: { 'common.ok': '确定' }, files: ['/repo/src/locales/zh-CN/common.json'] },
+    'en-US': {
+      path: '/repo/src/locales/en-US.json', flat: { 'common.ok': 'OK' },
+      files: ['/repo/src/locales/en-US.json'], keyFiles: { 'common.ok': '/repo/src/locales/en-US.json' },
+    },
+    'zh-CN': {
+      path: '/repo/src/locales/zh-CN', flat: { 'common.ok': '确定' },
+      files: ['/repo/src/locales/zh-CN/common.json'], keyFiles: { 'common.ok': '/repo/src/locales/zh-CN/common.json' },
+    },
     'ja-JP': { path: '/repo/src/locales/ja-JP.json', flat: {}, files: ['/repo/src/locales/ja-JP.json'] },
   };
   const localeTexts = {
@@ -396,6 +404,36 @@ test('collectLocaleKeyTargets returns every locale that defines the key, default
     { filePath: '/repo/src/locales/zh-CN/common.json', position: { line: 1, character: 2 } },
     { filePath: '/repo/src/locales/en-US.json', position: { line: 2, character: 4 } },
   ]);
+});
+
+test('findLocaleKeyTarget uses the recorded owner rather than namespace specificity', () => {
+  const index = '/repo/locales/en/system/index.json';
+  const specific = '/repo/locales/en/system/user.json';
+  const locale = {
+    flat: { 'system.user.name': 'Same text' },
+    files: [index, specific],
+    filePrefixes: { [index]: 'system', [specific]: 'system.user' },
+    keyFiles: { 'system.user.name': index },
+  };
+  const texts = { [index]: '{"user":{"name":"Same text"}}', [specific]: '{"name":"Same text"}' };
+  assert.equal(findLocaleKeyTarget(locale, 'system.user.name', texts).filePath, index);
+  locale.keyFiles['system.user.name'] = specific;
+  assert.equal(findLocaleKeyTarget(locale, 'system.user.name', texts).filePath, specific);
+  assert.equal(findLocaleKeyTarget(locale, 'system.user.missing', texts), undefined);
+});
+
+test('non-index module parsing excludes helpers and leaves file prefixes to the loader', () => {
+  const text = "const button = { save: 'Save' };\nconst internal = { debug: 'Debug only' };\nexport default { button: { save: 'Save changes' } };";
+  for (const file of ['common.ts', 'common.js']) {
+    assert.deepEqual(parseTsLocaleModule(text, file), { 'button.save': 'Save changes' });
+  }
+});
+
+test('index module parsing retains object bindings without adding a file prefix', () => {
+  const text = "const button = { save: 'Save' };\nexport default { title: 'Title' };";
+  for (const file of ['index.ts', 'index.js']) {
+    assert.deepEqual(parseTsLocaleModule(text, file), { title: 'Title', 'button.save': 'Save' });
+  }
 });
 
 test('findCodeKeyRanges returns every source usage of a key', () => {
