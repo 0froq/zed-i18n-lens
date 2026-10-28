@@ -1111,7 +1111,12 @@ export function getInlineCodeActions(text, range, locales = {}) {
     } else if (jsxAttr) {
       edit = { range: makeRange(text, jsxAttr.attrStart, jsxAttr.attrEnd), newText: `${jsxAttr.name}="${escapeHtml(value)}"` };
     } else if (jsxChild) {
-      edit = { range: makeRange(text, start - jsxOpen[0].length, end + jsxClose[0].length), newText: escapeHtml(value) };
+      // `{++counter}` or `Hello {name}` must stay a string, not a JSX expression.
+      if (/[{}]/.test(value)) {
+        edit = { range: makeRange(text, start, end), newText: escapeJsString(value, quote) };
+      } else {
+        edit = { range: makeRange(text, start - jsxOpen[0].length, end + jsxClose[0].length), newText: escapeHtml(value) };
+      }
     } else if (htmlText) {
       edit = { range: makeRange(text, start, end), newText: escapeHtml(value) };
     } else {
@@ -1124,6 +1129,16 @@ export function getInlineCodeActions(text, range, locales = {}) {
 
 function escapeHtml(value) {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function escapeJsString(value, quote) {
+  let escaped = String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(new RegExp(escapeRegExp(quote), 'g'), '\\' + quote)
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+  if (quote === '`') escaped = escaped.replace(/\$\{/g, '\\${');
+  return quote + escaped + quote;
 }
 
 function sameRange(a, b) {

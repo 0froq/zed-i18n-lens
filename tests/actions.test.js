@@ -177,6 +177,14 @@ test('inline JSX text child unwraps braces', () => {
   assert.equal(apply(padded, it.edit), '<h1>LiG</h1>');
 });
 
+test('inline JSX text child keeps braces when the translation contains {', () => {
+  const text = `<p>{t('greet')}</p>`;
+  const [expr] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: '{++counter}' } } });
+  assert.equal(apply(text, expr.edit), `<p>{'{++counter}'}</p>`);
+  const [interp] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: 'Hello {name}' } } });
+  assert.equal(apply(text, interp.edit), `<p>{'Hello {name}'}</p>`);
+});
+
 test('inline JSX attribute unwraps braces to a quoted attribute', () => {
   const text = `<img title={t('greet')} />`;
   const [en] = getInlineCodeActions(text, at(text, 't('), locales);
