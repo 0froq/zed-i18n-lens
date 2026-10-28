@@ -147,6 +147,8 @@ test('HTML attribute $t is inlined, not extracted', () => {
   assert.equal(apply(tc, getInlineCodeActions(tc, at(tc, '$tc'), locales)[0].edit), '<img alt="Say &quot;hi&quot; &lt;now&gt;">');
   const i18nT = `<img alt="i18n.t('greet')">`;
   assert.equal(apply(i18nT, getInlineCodeActions(i18nT, at(i18nT, 'i18n.t'), locales)[0].edit), '<img alt="Say &quot;hi&quot; &lt;now&gt;">');
+  const jsx = `<img title="t('greet')" />`;
+  assert.equal(apply(jsx, getInlineCodeActions(jsx, at(jsx, 't('), locales)[0].edit), '<img title="Say &quot;hi&quot; &lt;now&gt;" />');
 });
 
 test('inline skips partial HTML attribute expressions', () => {

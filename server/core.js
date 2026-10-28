@@ -309,10 +309,11 @@ function makeRange(text, start, end) {
 }
 // Lexical mask over mixed Vue/TS/JSX text: returns opaque ranges (comments,
 // plain strings, template-literal raw text, HTML comments, ordinary attribute
-// values) plus interiors of plain HTML/JSX attributes so i18n calls inside
-// `title="$t('…')"` can still be collected. Vue directive attribute values
-// (`:x="…"`, `v-x="…"`, `@x="…"`, `#x="…"`) and `${…}` interpolations stay
-// transparent. Best-effort lexing only — no AST.
+// values) plus interiors of plain HTML/JSX attributes. Those interiors look
+// like `title="$t('…')"` but are static text, not real calls — extractI18nKeys
+// skips them unless includeStaticAttrCalls (Inline only). Vue directive
+// attribute values (`:x="…"`, `v-x="…"`, `@x="…"`, `#x="…"`) and `${…}`
+// interpolations stay transparent. Best-effort lexing only — no AST.
 function computeOpaqueRanges(text) {
   const ranges = [];
   const attrValues = [];
@@ -405,8 +406,8 @@ function isAttrExprQuote(text, quoteOffset) {
 }
 
 // Plain HTML/JSX attributes (`title="…"`, `alt='…'`) stay opaque as strings so
-// apostrophes in values cannot swallow later code, but i18n calls inside them
-// are still collected (see collectFunctionCallKeys).
+// apostrophes in values cannot swallow later code. Lookalike t() text inside
+// them is not a real call (see extractI18nKeys includeStaticAttrCalls).
 function isPlainAttrQuote(text, quoteOffset) {
   const before = text.slice(0, quoteOffset);
   const lastLt = before.lastIndexOf('<');
@@ -429,10 +430,10 @@ function isOpaque(ranges, offset) {
 }
 
 
-export function extractI18nKeys(text) {
+export function extractI18nKeys(text, { includeStaticAttrCalls = false } = {}) {
   const found = [];
   const { ranges: opaque, attrValues } = computeOpaqueRanges(text);
-  collectFunctionCallKeys(text, found, opaque, attrValues);
+  collectFunctionCallKeys(text, found, opaque, includeStaticAttrCalls ? attrValues : []);
   collectFormatMessageKeys(text, found, opaque);
   const patterns = [
     // <i18n-t keypath="key"> (Vue I18n) and <Trans i18nKey="key"> (react-i18next)
@@ -895,7 +896,7 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
       return end > start ? s >= start && e <= end : s <= start && start <= e;
     });
   }
-  const calls = extractI18nKeys(text);
+  const calls = extractI18nKeys(text, { includeStaticAttrCalls: true });
   return targets.flatMap((diagnostic) => {
     const s = positionToOffset(text, diagnostic.range.start);
     const e = positionToOffset(text, diagnostic.range.end);
@@ -1069,7 +1070,7 @@ export function getInlineCodeActions(text, range, locales = {}) {
   const offset = positionToOffset(text, range.start);
   const endOffset = positionToOffset(text, range.end || range.start);
   // Cursor (or selection) must sit inside the call; a whole-file range offers nothing.
-  const item = extractI18nKeys(text).find((c) => c.call && offset >= c.call.start && endOffset <= c.call.end);
+  const item = extractI18nKeys(text, { includeStaticAttrCalls: true }).find((c) => c.call && offset >= c.call.start && endOffset <= c.call.end);
   if (!item || item.call.argCount !== 1) return [];
   const { start, end, quote } = item.call;
   const before = text.slice(0, start);
