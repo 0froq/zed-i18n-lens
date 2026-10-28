@@ -194,6 +194,22 @@ test('inline JSX text child keeps braces when the translation contains {', () =>
   assert.equal(apply(text, interp.edit), `<p>{'Hello {name}'}</p>`);
 });
 
+test('inline Vue interpolation keeps mustache when the translation contains {', () => {
+  const text = `<template><p>{{ t('greet') }}</p></template>`;
+  const [expr] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: '{++counter}' } } });
+  assert.equal(apply(text, expr.edit), `<template><p>{{ '{++counter}' }}</p></template>`);
+  const [interp] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: 'Hello {name}' } } });
+  assert.equal(apply(text, interp.edit), `<template><p>{{ 'Hello {name}' }}</p></template>`);
+  const [mustache] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: '{{ test }}' } } });
+  assert.equal(apply(text, mustache.edit), `<template><p>{{ '{{ test }}' }}</p></template>`);
+});
+
+test('inline Vue bound attribute keeps a string when the translation contains {', () => {
+  const text = `<template><img :alt="$t('greet')"></template>`;
+  const [en] = getInlineCodeActions(text, at(text, 'greet'), { en: { flat: { greet: '{{ test }}' } } });
+  assert.equal(apply(text, en.edit), `<template><img :alt="'{{ test }}'"></template>`);
+});
+
 test('inline JSX attribute unwraps braces to a quoted attribute', () => {
   const text = `<img title={t('greet')} />`;
   const [en] = getInlineCodeActions(text, at(text, 't('), locales);

@@ -1114,7 +1114,13 @@ export function getInlineCodeActions(text, range, locales = {}) {
     if (typeof value !== 'string') return [];
     let edit;
     if (interp && interpEnd) {
-      edit = { range: makeRange(text, start - interp[0].length, end + interpEnd[0].length), newText: escapeHtml(value) };
+      // `{++counter}` or `{{ test }}` must stay a JS string inside the
+      // mustache; stripping `{{ }}` would let Vue re-parse the braces.
+      if (/[{}]/.test(value)) {
+        edit = { range: makeRange(text, start, end), newText: escapeJsString(value, quote) };
+      } else {
+        edit = { range: makeRange(text, start - interp[0].length, end + interpEnd[0].length), newText: escapeHtml(value) };
+      }
     } else if (attr) {
       const jsQuote = attr.innerQuote || "'";
       const escaped = value
@@ -1122,9 +1128,12 @@ export function getInlineCodeActions(text, range, locales = {}) {
         .replace(new RegExp(jsQuote, 'g'), '\\' + jsQuote)
         .replace(/\r/g, '\\r')
         .replace(/\n/g, '\\n');
+      const vueBound = text[attr.attrStart] === ':' || text.startsWith('v-bind:', attr.attrStart);
       const boundLiteral = attr.innerQuote
         ? `:${attr.name}=${attr.openQuote}${attr.innerQuote}${escaped}${attr.innerQuote}${attr.openQuote}`
-        : `${attr.name}="${escapeHtml(value)}"`;
+        : vueBound && /[{}]/.test(value)
+          ? `:${attr.name}=${attr.openQuote}${escapeJsString(value, attr.openQuote === '"' ? "'" : '"')}${attr.openQuote}`
+          : `${attr.name}="${escapeHtml(value)}"`;
       edit = { range: makeRange(text, attr.attrStart, attr.attrEnd), newText: boundLiteral };
     } else if (jsxAttr) {
       edit = { range: makeRange(text, jsxAttr.attrStart, jsxAttr.attrEnd), newText: `${jsxAttr.name}="${escapeHtml(value)}"` };
