@@ -103,6 +103,12 @@ test('inline JS call becomes a quoted string literal', () => {
   assert.equal(apply(text, actions[0].edit), "const a = 'it\\'s';");
 });
 
+test('inline JS does not treat tags inside string literals as HTML context', () => {
+  const text = "const html = '<p>'; const label = t('greet');";
+  const [en] = getInlineCodeActions(text, at(text, "t('"), { en: { flat: { greet: 'Hello' } } });
+  assert.equal(apply(text, en.edit), "const html = '<p>'; const label = 'Hello';");
+});
+
 test('inline skips calls with params or outside a call', () => {
   const text = "t('greet', { n: 1 }); x";
   assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);

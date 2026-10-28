@@ -395,6 +395,7 @@ function computeOpaqueRanges(text) {
     ranges.push({ start: f.start, end: text.length });
     if (f.attrValue) attrValues.push({ start: f.start + 1, end: text.length });
   }
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
   return { ranges, attrValues };
 }
 
@@ -921,12 +922,13 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
 const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 
 /** Lightweight tag-stack scan: returns closed elements { tag, start, end, attrs }. */
-function scanElements(text) {
+function scanElements(text, opaque = computeOpaqueRanges(text).ranges) {
   const elements = [];
   const stack = [];
   const re = /<!--[\s\S]*?-->|<\/([A-Za-z][\w:.-]*)\s*>|<([A-Za-z][\w:.-]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
   let m;
   while ((m = re.exec(text))) {
+    if (isOpaque(opaque, m.index)) continue;
     if (m[1]) {
       const tag = m[1].toLowerCase();
       const idx = stack.map((x) => x.tag).lastIndexOf(tag);
@@ -956,7 +958,8 @@ function scanElements(text) {
 }
 
 function markupFrame(text, offset) {
-  const el = scanElements(text)
+  const opaque = computeOpaqueRanges(text).ranges;
+  const el = scanElements(text, opaque)
     .filter((e) => e.start <= offset && offset < e.end)
     .sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
   if (el) {
@@ -966,7 +969,7 @@ function markupFrame(text, offset) {
   const before = text.slice(0, offset);
   const lastLt = before.lastIndexOf('<');
   const lastGt = before.lastIndexOf('>');
-  if (lastLt > lastGt && /^[A-Za-z]/.test(before.slice(lastLt + 1))) return 'openTag';
+  if (lastLt > lastGt && /^[A-Za-z]/.test(before.slice(lastLt + 1)) && !isOpaque(opaque, lastLt)) return 'openTag';
   return 'code';
 }
 
