@@ -32,6 +32,16 @@ test('extract rewrites static attributes with surrounding whitespace', () => {
   assert.equal(apply(text, action.edit), `<template><input :title="$t('LoginForm.hello_world')"></template>`);
 });
 
+test('extract rewrites unquoted attributes to a bound $t call', () => {
+  const text = '<template><input title=Hello></template>';
+  const [action] = extract(text);
+  assert.equal(action.value, 'Hello');
+  assert.equal(apply(text, action.edit), `<template><input :title="$t('LoginForm.hello')"></template>`);
+  const html = '<input title=Save>';
+  const [htmlAction] = getExtractCodeActions(html, 'html', '/page.html', undefined, getRawTextDiagnostics(html, 'html', true), {});
+  assert.equal(apply(html, htmlAction.edit), `<input :title="$t('page.save')">`);
+});
+
 test('extract rewrites padded bound string literal attributes', () => {
   const text = `<template><input :placeholder=" 'Enter name' "></template>`;
   const [action] = extract(text);

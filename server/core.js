@@ -855,6 +855,13 @@ function attributeLiteralContext(text, contentStart, contentEnd) {
   const after = text.slice(contentEnd);
   let bound = /(?:^|[\s>])(?::|v-bind:)([\w-]+)\s*=\s*(["'])\s*(['"]?)\s*$/.exec(before);
   let plain = !bound && /(?:^|[\s>])([\w-]+)\s*=\s*(["'])\s*$/.exec(before);
+  const unquoted = !bound && !plain
+    && (/(?:^|[\s>])(?::|v-bind:)([\w-]+)\s*=\s*$/.exec(before)
+      || /(?:^|[\s>])([\w-]+)\s*=\s*$/.exec(before));
+  if (unquoted && !/^[^\s"'=<>`]/.test(after)) {
+    const attrStart = contentStart - unquoted[0].length + unquoted[0].search(/\S/);
+    return { name: unquoted[1], openQuote: '"', innerQuote: '', attrStart, attrEnd: contentEnd };
+  }
   const m = bound || plain;
   if (!m) return null;
   const name = m[1];
