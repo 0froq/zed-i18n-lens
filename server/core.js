@@ -1013,8 +1013,10 @@ export function getInlineCodeActions(text, range, locales = {}) {
   const interp = /\{\{\s*$/.exec(before);
   const interpEnd = /^\s*\}\}/.exec(after);
   const attr = attributeLiteralContext(text, start, end);
-  const inAttributeValue = /\s(?::|v-bind:)?[\w-]+\s*=\s*["']/.test(before) && /["']/.test(after);
-  if (inAttributeValue && !attr) return [];
+  if (!attr) {
+    const openAttr = /(?:^|[\s>])(?:(?::|v-bind:)?[\w-]+)\s*=\s*(["'])(?:(?!\1)[\s\S])*$/.exec(before);
+    if (openAttr && after.includes(openAttr[1])) return [];
+  }
   return Object.entries(locales).flatMap(([name, locale]) => {
     const value = locale?.flat?.[item.key];
     if (typeof value !== 'string') return [];

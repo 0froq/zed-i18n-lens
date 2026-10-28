@@ -104,6 +104,13 @@ test('inline skips partial attribute expressions', () => {
   assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
 });
 
+test('inline works for t() inside element that has unrelated attributes', () => {
+  const text = `<template><h2 class="x">{{ t('greet') }}</h2></template>`;
+  const actions = getInlineCodeActions(text, at(text, 't('), locales);
+  assert.equal(actions.length, 2);
+  assert.match(actions[0].title, /Inline i18n key "greet"/);
+});
+
 test('inline escapes quotes when rewriting bound attribute values', () => {
   const text = `<template><div :aria-label="$t('greet')"></div></template>`;
   const [action] = getInlineCodeActions(text, at(text, 'greet'), locales);
