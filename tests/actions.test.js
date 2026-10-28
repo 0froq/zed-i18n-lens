@@ -117,6 +117,60 @@ test('inline escapes quotes when rewriting bound attribute values', () => {
   assert.equal(apply(text, action.edit), '<template><div aria-label="Say &quot;hi&quot; &lt;now&gt;"></div></template>');
 });
 
+test('inline HTML text node replaces the call with raw locale text', () => {
+  const text = `<p>$t('greet')</p>`;
+  const actions = getInlineCodeActions(text, at(text, '$t'), locales);
+  assert.equal(apply(text, actions[0].edit), '<p>Say &quot;hi&quot; &lt;now&gt;</p>');
+  assert.equal(apply(text, actions[1].edit), '<p>你好</p>');
+  const mixed = `<p>Hello $t('it')!</p>`;
+  const [en] = getInlineCodeActions(mixed, at(mixed, '$t'), { en: { flat: { it: 'LiG' } } });
+  assert.equal(apply(mixed, en.edit), '<p>Hello LiG!</p>');
+});
+
+test('HTML attribute $t is inlined, not extracted', () => {
+  const text = `<a title="$t('greet')">x</a>`;
+  const range = at(text, '$t');
+  assert.deepEqual(getExtractCodeActions(text, 'html', '/page.html', range, [], {}), []);
+  const [en] = getInlineCodeActions(text, range, locales);
+  assert.equal(apply(text, en.edit), '<a title="Say &quot;hi&quot; &lt;now&gt;">x</a>');
+  const tc = `<img alt="$tc('greet')">`;
+  assert.equal(apply(tc, getInlineCodeActions(tc, at(tc, '$tc'), locales)[0].edit), '<img alt="Say &quot;hi&quot; &lt;now&gt;">');
+  const i18nT = `<img alt="i18n.t('greet')">`;
+  assert.equal(apply(i18nT, getInlineCodeActions(i18nT, at(i18nT, 'i18n.t'), locales)[0].edit), '<img alt="Say &quot;hi&quot; &lt;now&gt;">');
+});
+
+test('inline skips partial HTML attribute expressions', () => {
+  const text = `<a title="$t('greet') + 'x'">x</a>`;
+  assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
+});
+
+test('extract still rewrites ordinary HTML attributes', () => {
+  const text = '<p title="Hello world">Save</p>';
+  const actions = getExtractCodeActions(text, 'html', '/page.html', undefined, getRawTextDiagnostics(text, 'html', true), {});
+  assert.deepEqual(actions.map((a) => a.value).sort(), ['Hello world', 'Save']);
+});
+
+test('inline JSX text child unwraps braces', () => {
+  const text = `<h1>{t('greet')}</h1>`;
+  const [en] = getInlineCodeActions(text, at(text, 't('), locales);
+  assert.equal(apply(text, en.edit), '<h1>Say &quot;hi&quot; &lt;now&gt;</h1>');
+  const padded = `<h1>{ t('it') }</h1>`;
+  const [it] = getInlineCodeActions(padded, at(padded, 't('), { en: { flat: { it: 'LiG' } } });
+  assert.equal(apply(padded, it.edit), '<h1>LiG</h1>');
+});
+
+test('inline JSX attribute unwraps braces to a quoted attribute', () => {
+  const text = `<img title={t('greet')} />`;
+  const [en] = getInlineCodeActions(text, at(text, 't('), locales);
+  assert.equal(apply(text, en.edit), '<img title="Say &quot;hi&quot; &lt;now&gt;" />');
+});
+
+test('inline JSX keeps quotes inside mixed brace expressions', () => {
+  const text = `<h1>{t('it') + extra}</h1>`;
+  const [en] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { it: "it's" } } });
+  assert.equal(apply(text, en.edit), `<h1>{'it\\'s' + extra}</h1>`);
+});
+
 test('extract key prefix comes from the nearest ancestor with keys', () => {
   const text = `<template><div><p>{{ t('header.title') }}</p><section class="s"><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></div></template>`;
   const [action] = extract(text);

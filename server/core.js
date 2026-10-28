@@ -109,9 +109,11 @@ export function getRawTextDiagnostics(text, language, enabled = false, loose = f
   }).join('') + text.slice(previous);
   const document = parseDocument(masked, parserOptions);
   const diagnostics = [];
+  const calls = extractI18nKeys(text);
   function report(raw, start, value = raw) {
     const leading = raw.length - raw.trimStart().length;
     const trailing = raw.trimEnd().length;
+    if (calls.some((c) => c.call && c.call.start <= start + leading && start + trailing <= c.call.end)) return;
     if (!isLikelyUserFacingText(value, loose)) return;
     diagnostics.push({
       range: makeRange(text, start + leading, start + trailing),
@@ -305,14 +307,15 @@ function offsetToPosition(text, offset) {
 function makeRange(text, start, end) {
   return { start: offsetToPosition(text, start), end: offsetToPosition(text, end) };
 }
-// Lexical mask over mixed Vue/TS/JSX text: returns the sorted ranges that are
-// NOT real code — comments, plain strings, template-literal raw text, HTML
-// comments, and ordinary (non-directive) attribute values. Vue directive
-// attribute values (`:x="…"`, `v-x="…"`, `@x="…"`, `#x="…"`) and `${…}`
-// interpolations inside template literals stay transparent so real
-// expressions inside them are still scanned. Best-effort lexing only — no AST.
+// Lexical mask over mixed Vue/TS/JSX text: returns opaque ranges (comments,
+// plain strings, template-literal raw text, HTML comments, ordinary attribute
+// values) plus interiors of plain HTML/JSX attributes so i18n calls inside
+// `title="$t('…')"` can still be collected. Vue directive attribute values
+// (`:x="…"`, `v-x="…"`, `@x="…"`, `#x="…"`) and `${…}` interpolations stay
+// transparent. Best-effort lexing only — no AST.
 function computeOpaqueRanges(text) {
   const ranges = [];
+  const attrValues = [];
   const stack = [{ type: 'code' }];
   const top = () => stack[stack.length - 1];
   let i = 0;
@@ -336,7 +339,11 @@ function computeOpaqueRanges(text) {
     }
     if (f.type === 'string') {
       if (ch === '\\') { i += 2; continue; }
-      if (ch === f.quote) { ranges.push({ start: f.start, end: i + 1 }); stack.pop(); }
+      if (ch === f.quote) {
+        ranges.push({ start: f.start, end: i + 1 });
+        if (f.attrValue) attrValues.push({ start: f.start + 1, end: i });
+        stack.pop();
+      }
       i++;
       continue;
     }
@@ -374,7 +381,7 @@ function computeOpaqueRanges(text) {
     if (ch === '<' && text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') { stack.push({ type: 'htmlComment', start: i }); i += 4; continue; }
     if (ch === '"' || ch === "'") {
       if (f.type === 'code' && isAttrExprQuote(text, i)) stack.push({ type: 'attrExpr', quote: ch, depth: 0 });
-      else stack.push({ type: 'string', quote: ch, start: i });
+      else stack.push({ type: 'string', quote: ch, start: i, attrValue: f.type === 'code' && isPlainAttrQuote(text, i) });
       i++;
       continue;
     }
@@ -383,17 +390,29 @@ function computeOpaqueRanges(text) {
   }
   while (stack.length > 1) {
     const f = stack.pop();
-    if (f.start !== undefined) ranges.push({ start: f.start, end: text.length });
+    if (f.start === undefined) continue;
+    ranges.push({ start: f.start, end: text.length });
+    if (f.attrValue) attrValues.push({ start: f.start + 1, end: text.length });
   }
-  return ranges;
+  return { ranges, attrValues };
 }
 
 // A quote is a Vue directive attribute opener when preceded by `name=` where
 // name is `:foo`, `@foo`, `#foo`, `v-foo`, or `ns:foo` (v-on:, v-bind:, …).
-// Plain attributes (`title="…"`, JSX `attr="…"`) keep string semantics.
 function isAttrExprQuote(text, quoteOffset) {
   const before = text.slice(Math.max(0, quoteOffset - 200), quoteOffset);
   return /(?:^|[\s<"'`])(?:[:@#][\w.:[\]-]*|[\w-]+:[\w.:[\]-]*|v-[\w.:[\]-]*)\s*=\s*$/.test(before);
+}
+
+// Plain HTML/JSX attributes (`title="…"`, `alt='…'`) stay opaque as strings so
+// apostrophes in values cannot swallow later code, but i18n calls inside them
+// are still collected (see collectFunctionCallKeys).
+function isPlainAttrQuote(text, quoteOffset) {
+  const before = text.slice(0, quoteOffset);
+  const lastLt = before.lastIndexOf('<');
+  const lastGt = before.lastIndexOf('>');
+  if (lastLt < 0 || lastLt < lastGt || !/^[A-Za-z]/.test(before.slice(lastLt + 1))) return false;
+  return /(?:^|[\s"'`/])[\w.:[\]-]+\s*=\s*$/.test(before.slice(-80));
 }
 
 function isOpaque(ranges, offset) {
@@ -412,8 +431,8 @@ function isOpaque(ranges, offset) {
 
 export function extractI18nKeys(text) {
   const found = [];
-  const opaque = computeOpaqueRanges(text);
-  collectFunctionCallKeys(text, found, opaque);
+  const { ranges: opaque, attrValues } = computeOpaqueRanges(text);
+  collectFunctionCallKeys(text, found, opaque, attrValues);
   collectFormatMessageKeys(text, found, opaque);
   const patterns = [
     // <i18n-t keypath="key"> (Vue I18n) and <Trans i18nKey="key"> (react-i18next)
@@ -441,14 +460,15 @@ export function extractI18nKeys(text) {
   return found;
 }
 
-function collectFunctionCallKeys(text, found, opaque) {
+function collectFunctionCallKeys(text, found, opaque, attrValues = []) {
   // t/$t/tc/$tc/i18n.t/i18n.tc(...) — function calls, incl. Vue I18n plural tc
   const re = /(?:\x24tc?|\btc?|\bi18n\.tc?)\s*\(/g;
   let match;
   while ((match = re.exec(text))) {
     const parenOffset = re.lastIndex - 1;
     if (/[\w$]/.test(text[match.index - 1] || '')) continue;
-    if (isOpaque(opaque, match.index)) continue;
+    const inAttr = attrValues.some((r) => match.index >= r.start && match.index < r.end);
+    if (!inAttr && isOpaque(opaque, match.index)) continue;
     const callText = readParens(text, parenOffset);
     if (!callText) continue;
     // First arg must be exactly one string literal — dynamic keys like
@@ -868,9 +888,11 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
       return end > start ? s >= start && e <= end : s <= start && start <= e;
     });
   }
+  const calls = extractI18nKeys(text);
   return targets.flatMap((diagnostic) => {
     const s = positionToOffset(text, diagnostic.range.start);
     const e = positionToOffset(text, diagnostic.range.end);
+    if (calls.some((c) => c.call && c.call.start <= s && e <= c.call.end)) return [];
     const value = text.slice(s, e).replace(/\s+/g, ' ');
     // v1: no entities or interpolation-like content; their decoded value is ambiguous.
     if (!value || /[&<>{}]/.test(value)) return [];
@@ -908,7 +930,7 @@ function scanElements(text) {
     } else if (m[2]) {
       const tag = m[2].toLowerCase();
       if (m[4] || VOID_ELEMENTS.has(tag)) continue;
-      const el = { tag, start: m.index, end: text.length, attrs: m[3] };
+      const el = { tag, start: m.index, end: text.length, attrs: m[3], openEnd: re.lastIndex };
       if (tag === 'script' || tag === 'style') {
         const close = text.toLowerCase().indexOf('</' + tag, re.lastIndex);
         const stop = close < 0 ? text.length : text.indexOf('>', close) + 1 || text.length;
@@ -922,6 +944,33 @@ function scanElements(text) {
   }
   while (stack.length) elements.push(stack.pop());
   return elements;
+}
+
+function markupFrame(text, offset) {
+  const el = scanElements(text)
+    .filter((e) => e.start <= offset && offset < e.end)
+    .sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+  if (el) {
+    if (el.tag === 'script' || el.tag === 'style') return 'script';
+    return offset < el.openEnd ? 'openTag' : 'text';
+  }
+  const before = text.slice(0, offset);
+  const lastLt = before.lastIndexOf('<');
+  const lastGt = before.lastIndexOf('>');
+  if (lastLt > lastGt && /^[A-Za-z]/.test(before.slice(lastLt + 1))) return 'openTag';
+  return 'code';
+}
+
+function jsxAttributeContext(text, start, end) {
+  if (markupFrame(text, start) !== 'openTag') return null;
+  const before = text.slice(0, start);
+  const after = text.slice(end);
+  const m = /(?:^|[\s<])([\w-]+)\s*=\s*\{\s*$/.exec(before);
+  const close = /^\s*\}/.exec(after);
+  if (!m || !close) return null;
+  const attrStart = start - m[0].length + m[0].search(/\S/);
+  const attrEnd = end + close[0].length;
+  return { name: m[1], attrStart, attrEnd };
 }
 
 function commonKeyPrefix(keys) {
@@ -1017,6 +1066,12 @@ export function getInlineCodeActions(text, range, locales = {}) {
     const openAttr = /(?:^|[\s>])(?:(?::|v-bind:)?[\w-]+)\s*=\s*(["'])(?:(?!\1)[\s\S])*$/.exec(before);
     if (openAttr && after.includes(openAttr[1])) return [];
   }
+  const jsxAttr = !attr && jsxAttributeContext(text, start, end);
+  const frame = markupFrame(text, start);
+  const jsxOpen = /\{\s*$/.exec(before);
+  const jsxClose = /^\s*\}/.exec(after);
+  const jsxChild = !attr && !jsxAttr && frame === 'text' && jsxOpen && jsxClose;
+  const htmlText = !attr && !jsxAttr && !jsxChild && frame === 'text' && !/\{[^{]*$/.test(before);
   return Object.entries(locales).flatMap(([name, locale]) => {
     const value = locale?.flat?.[item.key];
     if (typeof value !== 'string') return [];
@@ -1034,6 +1089,12 @@ export function getInlineCodeActions(text, range, locales = {}) {
         ? `:${attr.name}=${attr.openQuote}${attr.innerQuote}${escaped}${attr.innerQuote}${attr.openQuote}`
         : `${attr.name}="${escapeHtml(value)}"`;
       edit = { range: makeRange(text, attr.attrStart, attr.attrEnd), newText: boundLiteral };
+    } else if (jsxAttr) {
+      edit = { range: makeRange(text, jsxAttr.attrStart, jsxAttr.attrEnd), newText: `${jsxAttr.name}="${escapeHtml(value)}"` };
+    } else if (jsxChild) {
+      edit = { range: makeRange(text, start - jsxOpen[0].length, end + jsxClose[0].length), newText: escapeHtml(value) };
+    } else if (htmlText) {
+      edit = { range: makeRange(text, start, end), newText: escapeHtml(value) };
     } else {
       const escaped = value.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
       edit = { range: makeRange(text, start, end), newText: quote + escaped + quote };
@@ -1154,7 +1215,7 @@ export function localeKeyAtPosition(locale, filePath, text, position) {
 
 export function getCompletionPrefix(text, position) {
   const before = text.slice(0, positionToOffset(text, position));
-  const opaque = computeOpaqueRanges(before);
+  const { ranges: opaque } = computeOpaqueRanges(before);
   const patterns = [
     /(?:\x24tc?|\btc?|\bi18n\.tc?)\s*\(\s*['"]([A-Za-z0-9_.:-]*)$/,
     /\bformatMessage\s*\(\s*\{[^}]*?\bid\s*:\s*['"]([A-Za-z0-9_.:-]*)$/,

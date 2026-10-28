@@ -31,6 +31,11 @@ test('recognition retains Vue attributes, JSX and template-literal expressions',
   for (const item of items) assert.equal(source.slice(item.startOffset, item.endOffset), item.key);
 });
 
+test('recognition finds i18n calls in plain HTML attributes', () => {
+  const source = `<a title="$t('nav.docs')" alt="t('site.title')" data-tip="i18n.t('help')">$t('site.footer')</a>`;
+  assert.deepEqual(extractI18nKeys(source).map((item) => item.key), ['nav.docs', 'site.title', 'help', 'site.footer']);
+});
+
 test('completion distinguishes empty i18n strings from non-i18n contexts', () => {
   assert.equal(prefix("t('"), '');
   assert.equal(prefix("const x = 1;"), undefined);
