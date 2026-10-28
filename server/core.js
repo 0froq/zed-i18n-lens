@@ -898,6 +898,7 @@ export function getExtractCodeActions(text, language, filePath, range, diagnosti
     if (!value || /[&<>{}]/.test(value)) return [];
     const { prefix, source: keySource } = deriveKeyPrefix(text, language, filePath, s, e, defaultFlat);
     const key = uniqueKey(prefix + '.' + slugify(value), defaultFlat);
+    if (!key) return [];
     const attr = attributeLiteralContext(text, s, e);
     let edit;
     if (attr) {
@@ -1041,10 +1042,17 @@ function slugify(value) {
 }
 
 function uniqueKey(base, flat) {
-  const taken = (key) => Object.keys(flat).some((k) => k === key || k.startsWith(key + '.') || key.startsWith(k + '.'));
-  let key = base;
-  for (let n = 2; taken(key); n++) key = base + '_' + n;
-  return key;
+  const keys = Object.keys(flat);
+  const taken = (key) => keys.some((k) => k === key || k.startsWith(key + '.') || key.startsWith(k + '.'));
+  if (!taken(base)) return base;
+  // A leaf ancestor (`Home` vs `Home.hello_world`) stays a prefix of every
+  // suffixed candidate, so looping `_2`, `_3`, … never terminates.
+  if (keys.some((k) => base.startsWith(k + '.'))) return undefined;
+  for (let n = 2; n <= 10000; n++) {
+    const key = base + '_' + n;
+    if (!taken(key)) return key;
+  }
+  return undefined;
 }
 
 /**

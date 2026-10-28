@@ -208,3 +208,9 @@ test('extract derived key avoids collisions', () => {
   assert.equal(extract(text, { 'palette.sections.syntax': 'S' })[0].key, 'palette.sections.syntax_2');
   assert.equal(extract(text, { 'palette.sections.syntax.x': 'S' })[0].key, 'palette.sections.syntax_2');
 });
+
+test('extract skips when a parent locale key would loop uniqueKey forever', () => {
+  const text = '<template><p>Hello world</p></template>';
+  assert.deepEqual(getExtractCodeActions(text, 'vue', '/src/Home.vue', undefined, getRawTextDiagnostics(text, 'vue', true), { Home: '首页' }), []);
+  assert.deepEqual(extract(`<template><section><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></template>`, { 'palette.sections': 'S' }), []);
+});
