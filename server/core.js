@@ -1120,8 +1120,7 @@ export function getInlineCodeActions(text, range, locales = {}) {
     } else if (htmlText) {
       edit = { range: makeRange(text, start, end), newText: escapeHtml(value) };
     } else {
-      const escaped = value.replace(/\\/g, '\\\\').replace(new RegExp(quote, 'g'), '\\' + quote).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-      edit = { range: makeRange(text, start, end), newText: quote + escaped + quote };
+      edit = { range: makeRange(text, start, end), newText: escapeJsString(value, quote) };
     }
     return [{ title: `Inline i18n key "${item.key}" as ${name}`, edit }];
   });
@@ -1138,6 +1137,9 @@ function escapeJsString(value, quote) {
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n');
   if (quote === '`') escaped = escaped.replace(/\$\{/g, '\\${');
+  // Break </script> / </style> so a generated literal cannot close an HTML
+  // <script> / <style> element. `\/` is still `/` in JS string values.
+  escaped = escaped.replace(/<\/(script|style)/gi, '<\\/$1');
   return quote + escaped + quote;
 }
 

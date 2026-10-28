@@ -109,6 +109,15 @@ test('inline JS does not treat tags inside string literals as HTML context', () 
   assert.equal(apply(text, en.edit), "const html = '<p>'; const label = 'Hello';");
 });
 
+test('inline JS inside HTML script breaks </script> in the generated string', () => {
+  const text = `<script>const label = t('greet');</script>`;
+  const [en] = getInlineCodeActions(text, at(text, 't('), { en: { flat: { greet: 'Hello</script><img>' } } });
+  assert.equal(apply(text, en.edit), `<script>const label = 'Hello<\\/script><img>';</script>`);
+  const mixed = `<script>const label = t('greet');</script>`;
+  const [upper] = getInlineCodeActions(mixed, at(mixed, 't('), { en: { flat: { greet: '</SCRIPT>' } } });
+  assert.equal(apply(mixed, upper.edit), `<script>const label = '<\\/SCRIPT>';</script>`);
+});
+
 test('inline skips calls with params or outside a call', () => {
   const text = "t('greet', { n: 1 }); x";
   assert.deepEqual(getInlineCodeActions(text, at(text, 'greet'), locales), []);
