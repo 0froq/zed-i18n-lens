@@ -1055,15 +1055,33 @@ function slugify(value) {
 function uniqueKey(base, flat) {
   const keys = Object.keys(flat);
   const taken = (key) => keys.some((k) => k === key || k.startsWith(key + '.') || key.startsWith(k + '.'));
-  if (!taken(base)) return base;
-  // A leaf ancestor (`Home` vs `Home.hello_world`) stays a prefix of every
-  // suffixed candidate, so looping `_2`, `_3`, … never terminates.
-  if (keys.some((k) => base.startsWith(k + '.'))) return undefined;
-  for (let n = 2; n <= 10000; n++) {
-    const key = base + '_' + n;
-    if (!taken(key)) return key;
+
+  function allocate(candidate) {
+    if (!candidate) return undefined;
+    if (!taken(candidate)) return candidate;
+    // Suffixing the last segment cannot escape a leaf ancestor (`Home` vs
+    // `Home.hello_world_2`), so give up this candidate rather than loop.
+    if (keys.some((k) => candidate.startsWith(k + '.'))) return undefined;
+    for (let n = 2; n <= 10000; n++) {
+      const key = candidate + '_' + n;
+      if (!taken(key)) return key;
+    }
+    return undefined;
   }
-  return undefined;
+
+  // Prefixes that are already string leaves cannot host children. Drop those
+  // segments and keep the rest under the longest still-object (or empty)
+  // prefix: `hello.hello_world` with leaf `hello` → `hello_world`; `a.b.c.d`
+  // with leaf `a.b` → `a.c.d`. Exact / descendant collisions still suffix
+  // the last segment (`d_2`, `d_3`, …).
+  const parts = base.split('.');
+  const kept = [];
+  for (let i = 0; i < parts.length; i++) {
+    const next = [...kept, parts[i]].join('.');
+    if (i < parts.length - 1 && Object.hasOwn(flat, next)) continue;
+    kept.push(parts[i]);
+  }
+  return allocate(kept.join('.'));
 }
 
 /**

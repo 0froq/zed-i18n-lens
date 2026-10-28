@@ -244,8 +244,18 @@ test('extract derived key avoids collisions', () => {
   assert.equal(extract(text, { 'palette.sections.syntax.x': 'S' })[0].key, 'palette.sections.syntax_2');
 });
 
-test('extract skips when a parent locale key would loop uniqueKey forever', () => {
+test('extract uses an alt key when a parent locale key is a leaf', () => {
   const text = '<template><p>Hello world</p></template>';
-  assert.deepEqual(getExtractCodeActions(text, 'vue', '/src/Home.vue', undefined, getRawTextDiagnostics(text, 'vue', true), { Home: '首页' }), []);
-  assert.deepEqual(extract(`<template><section><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></template>`, { 'palette.sections': 'S' }), []);
+  const raw = getRawTextDiagnostics(text, 'vue', true);
+  assert.equal(getExtractCodeActions(text, 'vue', '/src/Home.vue', undefined, raw, { Home: '首页' })[0].key, 'hello_world');
+  assert.equal(getExtractCodeActions(text, 'vue', '/src/hello.vue', undefined, raw, { hello: 'x' })[0].key, 'hello_world');
+  assert.equal(getExtractCodeActions(text, 'vue', '/src/Home.vue', undefined, raw, { Home: '首页', hello_world: 'other' })[0].key, 'hello_world_2');
+
+  const nested = `<template><section><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></template>`;
+  assert.equal(extract(nested, { 'palette.sections': 'S' })[0].key, 'palette.syntax');
+
+  const deep = `<template><section><h2>{{ t('a.b.c.existing') }}</h2><p>Hello world</p></section></template>`;
+  assert.equal(extract(deep, { 'a.b.c.existing': 'x' })[0].key, 'a.b.c.hello_world');
+  assert.equal(extract(deep, { 'a.b.c.existing': 'x', 'a.b.c.hello_world': 'y' })[0].key, 'a.b.c.hello_world_2');
+  assert.equal(extract(deep, { 'a.b': 'leaf' })[0].key, 'a.c.hello_world');
 });
