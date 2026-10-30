@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { parseDocument, DomUtils } from 'htmlparser2';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { getExtractCodeActions, getInlineCodeActions, getRawTextDiagnostics } from '../server/core.js';
 
@@ -210,6 +212,34 @@ test('inline Vue bound attribute keeps a string when the translation contains {'
   assert.equal(apply(text, en.edit), `<template><img :alt="'{{ test }}'"></template>`);
 });
 
+test('inline bound attributes round-trip braces, quotes and entities through HTML and JS', () => {
+  const attributes = [
+    `:alt="t('greet')"`,
+    `:alt='t("greet")'`,
+    `v-bind:alt="t('greet')"`,
+    `v-bind:alt='t("greet")'`,
+  ];
+  const values = [
+    'Hello {name}, say "hi"',
+    "It's {name}",
+    '{++counter} &quot; &#39; & <tag> "both\'quotes" \\path\r\nNext line',
+  ];
+  for (const attribute of attributes) {
+    const text = `<template><img ${attribute} data-keep="unchanged"></template>`;
+    for (const value of values) {
+      const [action] = getInlineCodeActions(text, at(text, 'greet'), { en: { flat: { greet: value } } });
+      assert.ok(action, attribute);
+      const updated = apply(text, action.edit);
+      const image = DomUtils.findOne((node) => node.name === 'img', parseDocument(updated).children, true);
+      assert.deepEqual(Object.keys(image.attribs).sort(), [':alt', 'data-keep'], updated);
+      assert.equal(image.attribs['data-keep'], 'unchanged');
+      const context = { counter: 0 };
+      assert.equal(vm.runInNewContext(image.attribs[':alt'], context, { timeout: 1000 }), value, updated);
+      assert.equal(context.counter, 0, 'translation stays text rather than executing an expression');
+    }
+  }
+});
+
 test('inline JSX attribute unwraps braces to a quoted attribute', () => {
   const text = `<img title={t('greet')} />`;
   const [en] = getInlineCodeActions(text, at(text, 't('), locales);
@@ -258,6 +288,18 @@ test('extract derived key avoids collisions', () => {
   const text = `<template><section><h2>{{ t('palette.sections.syntaxTitle') }}</h2><p>Syntax</p></section></template>`;
   assert.equal(extract(text, { 'palette.sections.syntax': 'S' })[0].key, 'palette.sections.syntax_2');
   assert.equal(extract(text, { 'palette.sections.syntax.x': 'S' })[0].key, 'palette.sections.syntax_2');
+});
+
+test('extract bounds dense collision searches without rescanning all locale keys', { timeout: 2000 }, () => {
+  const text = '<template><p>Hello world</p></template>';
+  const flat = Object.fromEntries(Array.from({ length: 100000 }, (_, i) => [`other.key${i}`, 'Other']));
+  flat['LoginForm.hello_world'] = 'Taken';
+  for (let i = 2; i <= 10000; i++) flat[`LoginForm.hello_world_${i}`] = 'Taken';
+  assert.deepEqual(extract(text, flat), []);
+  delete flat['LoginForm.hello_world_9999'];
+  flat['LoginForm.hello_world_9999.child'] = 'Taken branch';
+  delete flat['LoginForm.hello_world_10000'];
+  assert.equal(extract(text, flat)[0].key, 'LoginForm.hello_world_10000');
 });
 
 test('extract uses an alt key when a parent locale key is a leaf', () => {

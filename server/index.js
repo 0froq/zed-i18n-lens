@@ -190,7 +190,13 @@ connection.onCodeAction((params) => {
     }
   }
   actions.push(...getCreateKeyActions(diagnostics, getProjectContext(params.textDocument.uri)));
-  if (clientSupportsDocumentChanges && doc && !isLocaleFileUri(doc.uri)) actions.push(...getExtractActions(doc, params, diagnostics), ...getInlineActions(doc, params));
+  if (clientSupportsDocumentChanges && doc && !isLocaleFileUri(doc.uri)) {
+    // A refactor failure must not discard existing quick fixes or its sibling action.
+    try { actions.push(...getExtractActions(doc, params, diagnostics)); }
+    catch (error) { connection.console.error(`Extract failed for ${doc.uri}: ${error.message}`); }
+    try { actions.push(...getInlineActions(doc, params)); }
+    catch (error) { connection.console.error(`Inline failed for ${doc.uri}: ${error.message}`); }
+  }
   return actions;
 });
 

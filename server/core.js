@@ -1053,15 +1053,25 @@ function slugify(value) {
 }
 
 function uniqueKey(base, flat) {
-  const keys = Object.keys(flat);
-  const taken = (key) => keys.some((k) => k === key || k.startsWith(key + '.') || key.startsWith(k + '.'));
+  const leaves = new Set(Object.keys(flat));
+  const branches = new Set();
+  for (const key of leaves) {
+    for (let dot = key.indexOf('.'); dot !== -1; dot = key.indexOf('.', dot + 1)) branches.add(key.slice(0, dot));
+  }
+  const hasLeafAncestor = (key) => {
+    for (let dot = key.indexOf('.'); dot !== -1; dot = key.indexOf('.', dot + 1)) {
+      if (leaves.has(key.slice(0, dot))) return true;
+    }
+    return false;
+  };
+  const taken = (key) => leaves.has(key) || branches.has(key) || hasLeafAncestor(key);
 
   function allocate(candidate) {
     if (!candidate) return undefined;
     if (!taken(candidate)) return candidate;
     // Suffixing the last segment cannot escape a leaf ancestor (`Home` vs
     // `Home.hello_world_2`), so give up this candidate rather than loop.
-    if (keys.some((k) => candidate.startsWith(k + '.'))) return undefined;
+    if (hasLeafAncestor(candidate)) return undefined;
     for (let n = 2; n <= 10000; n++) {
       const key = candidate + '_' + n;
       if (!taken(key)) return key;
@@ -1122,18 +1132,17 @@ export function getInlineCodeActions(text, range, locales = {}) {
         edit = { range: makeRange(text, start - interp[0].length, end + interpEnd[0].length), newText: escapeHtml(value) };
       }
     } else if (attr) {
-      const jsQuote = attr.innerQuote || "'";
-      const escaped = value
-        .replace(/\\/g, '\\\\')
-        .replace(new RegExp(jsQuote, 'g'), '\\' + jsQuote)
-        .replace(/\r/g, '\\r')
-        .replace(/\n/g, '\\n');
       const vueBound = text[attr.attrStart] === ':' || text.startsWith('v-bind:', attr.attrStart);
-      const boundLiteral = attr.innerQuote
-        ? `:${attr.name}=${attr.openQuote}${attr.innerQuote}${escaped}${attr.innerQuote}${attr.openQuote}`
-        : vueBound && /[{}]/.test(value)
-          ? `:${attr.name}=${attr.openQuote}${escapeJsString(value, attr.openQuote === '"' ? "'" : '"')}${attr.openQuote}`
-          : `${attr.name}="${escapeHtml(value)}"`;
+      let boundLiteral;
+      if (attr.innerQuote || (vueBound && /[{}]/.test(value))) {
+        const jsQuote = attr.innerQuote || (attr.openQuote === '"' ? "'" : '"');
+        // The JS literal is nested in HTML: JS escapes alone cannot protect the
+        // outer attribute quote or preserve literal entity text such as &quot;.
+        const expression = escapeHtmlAttribute(escapeJsString(value, jsQuote), attr.openQuote);
+        boundLiteral = `:${attr.name}=${attr.openQuote}${expression}${attr.openQuote}`;
+      } else {
+        boundLiteral = `${attr.name}="${escapeHtml(value)}"`;
+      }
       edit = { range: makeRange(text, attr.attrStart, attr.attrEnd), newText: boundLiteral };
     } else if (jsxAttr) {
       edit = { range: makeRange(text, jsxAttr.attrStart, jsxAttr.attrEnd), newText: `${jsxAttr.name}="${escapeHtml(value)}"` };
@@ -1155,6 +1164,11 @@ export function getInlineCodeActions(text, range, locales = {}) {
 
 function escapeHtml(value) {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function escapeHtmlAttribute(value, quote) {
+  const escaped = escapeHtml(value);
+  return quote === "'" ? escaped.replace(/'/g, '&#39;') : escaped;
 }
 
 function escapeJsString(value, quote) {
